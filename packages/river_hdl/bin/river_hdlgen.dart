@@ -123,6 +123,8 @@ Future<void> main(List<String> arguments) async {
 
   Logger.root.finest('River SoC configured: $socConfig');
 
+  List<String> staticInstructions = [];
+
   final ip = RiverSoCIP(
     socConfig,
     deviceOptions: Map.fromEntries(
@@ -162,6 +164,7 @@ Future<void> main(List<String> arguments) async {
             ),
           ),
     ),
+    staticInstructions: staticInstructions,
   );
 
   Logger.root.finest('River SoC module created: $ip');

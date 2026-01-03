@@ -83,6 +83,7 @@ Future<void> pipelineTest(
     rs2Read,
     rdWrite,
     null,
+    null,
     microcode: microcode,
     mxlen: mxlen,
     mideleg: csrs.mideleg,

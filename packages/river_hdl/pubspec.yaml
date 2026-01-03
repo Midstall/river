@@ -20,6 +20,10 @@ dependencies:
     git:
       url: https://github.com/MidstallSoftware/rohd-hcl.git
       ref: integration
+  z3:
+    git:
+      url: https://github.com/pingbird/dz3
+      path: dz3
   # path: ^1.9.0
 
 dev_dependencies:

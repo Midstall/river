@@ -42,6 +42,7 @@
 
             gitHashes = {
               rohd_hcl = "sha256-YobXIH2PTUXxp6MfcAIJG8aXhkc1MZOLthOEaQUJxOM=";
+              z3 = "sha256-B1gmCsFivLDKCJcBmdf2JOJqDvn6bEawqJ8QLix5Ils=";
             };
 
             buildDartTest =
@@ -120,6 +121,10 @@
 
                 src = ./.;
 
+                buildInputs = [
+                  pkgs.z3
+                ];
+
                 dartEntryPoints = {
                   "bin/river-emulator" = "packages/river_emulator/bin/river_emulator.dart";
                   "bin/river-hdlgen" = "packages/river_hdl/bin/river_hdlgen.dart";
@@ -127,6 +132,10 @@
 
                 preBuild = ''
                   mkdir -p bin
+                '';
+
+                postBuild = ''
+                  patchelf bin/river-hdlgen --add-needed libz3.so
                 '';
               };
               emulator = buildDartApplication {
@@ -146,6 +155,10 @@
                 pname = "river-hdl";
                 inherit version pubspecLock gitHashes;
 
+                buildInputs = [
+                  pkgs.z3
+                ];
+
                 src = ./.;
                 packageRoot = "packages/river_hdl";
 
@@ -154,10 +167,16 @@
                 preBuild = ''
                   mkdir -p bin
                 '';
+
+                postBuild = ''
+                  patchelf bin/river-hdlgen --add-needed libz3.so
+                '';
               };
             };
 
             devShells.default = pkgs.mkShell {
+              LD_LIBRARY_PATH = "${pkgs.z3.lib}/lib";
+
               packages =
                 with pkgs;
                 (
@@ -167,7 +186,9 @@
                     yosys
                     icestorm
                     nextpnr
+                    z3
                     gtkwave
+                    surfer
                     pkgsCross.riscv32-embedded.stdenv.cc
                     pkgsCross.riscv64-embedded.stdenv.cc
                   ]

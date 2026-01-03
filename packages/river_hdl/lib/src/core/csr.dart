@@ -119,7 +119,11 @@ class RiscVCsrFile extends Module {
     addOutput('mideleg', width: mxlen.size);
     addOutput('medeleg', width: mxlen.size);
     addOutput('mtvec', width: mxlen.size);
-    addOutput('stvec', width: mxlen.size);
+
+    if (hasSupervisor) {
+      addOutput('stvec', width: mxlen.size);
+      addOutput('satp', width: mxlen.size);
+    }
 
     void _checkFits(String n, int v) {
       final max = (mxlen.size >= 63) ? null : (1 << mxlen.size);
@@ -197,9 +201,14 @@ class RiscVCsrFile extends Module {
         _csrTop.getBackdoorPortsByAddr(0, CsrAddress.medeleg.address).rdData!;
     mtvec <=
         _csrTop.getBackdoorPortsByAddr(0, CsrAddress.mtvec.address).rdData!;
-    if (hasSupervisor)
+
+    if (hasSupervisor) {
       stvec! <=
           _csrTop.getBackdoorPortsByAddr(0, CsrAddress.stvec.address).rdData!;
+
+      satp! <=
+          _csrTop.getBackdoorPortsByAddr(0, CsrAddress.satp.address).rdData!;
+    }
 
     if (externalPending != null) {
       final mip = _csrTop.getBackdoorPortsByAddr(0, CsrAddress.mip.address);
@@ -256,6 +265,7 @@ class RiscVCsrFile extends Module {
         addr: CsrAddress.mstatus.address,
         resetValue: 0,
         width: mxlen.size,
+        isBackdoorWritable: false,
       ),
       CsrInstanceConfig(
         arch: SimpleRwCsr('mie'),
@@ -275,6 +285,7 @@ class RiscVCsrFile extends Module {
         addr: CsrAddress.mtvec.address,
         resetValue: 0,
         width: mxlen.size,
+        isBackdoorWritable: false,
       ),
       CsrInstanceConfig(
         arch: SimpleRwCsr('mscratch'),
@@ -288,18 +299,21 @@ class RiscVCsrFile extends Module {
         addr: CsrAddress.mepc.address,
         resetValue: 0,
         width: mxlen.size,
+        isBackdoorWritable: false,
       ),
       CsrInstanceConfig(
         arch: SimpleRwCsr('mcause'),
         addr: CsrAddress.mcause.address,
         resetValue: 0,
         width: mxlen.size,
+        isBackdoorWritable: false,
       ),
       CsrInstanceConfig(
         arch: SimpleRwCsr('mtval'),
         addr: CsrAddress.mtval.address,
         resetValue: 0,
         width: mxlen.size,
+        isBackdoorWritable: false,
       ),
       CsrInstanceConfig(
         arch: SimpleRwCsr('medeleg'),
@@ -312,6 +326,7 @@ class RiscVCsrFile extends Module {
         addr: CsrAddress.mideleg.address,
         resetValue: 0,
         width: mxlen.size,
+        isBackdoorWritable: false,
       ),
 
       if (hasSupervisor) ...[
@@ -320,54 +335,63 @@ class RiscVCsrFile extends Module {
           addr: CsrAddress.sstatus.address,
           resetValue: 0,
           width: mxlen.size,
+          isBackdoorWritable: false,
         ),
         CsrInstanceConfig(
           arch: SimpleRwCsr('sie'),
           addr: CsrAddress.sie.address,
           resetValue: 0,
           width: mxlen.size,
+          isBackdoorWritable: false,
         ),
         CsrInstanceConfig(
           arch: SimpleRwCsr('sip'),
           addr: CsrAddress.sip.address,
           resetValue: 0,
           width: mxlen.size,
+          isBackdoorWritable: false,
         ),
         CsrInstanceConfig(
           arch: SimpleRwCsr('stvec'),
           addr: CsrAddress.stvec.address,
           resetValue: 0,
           width: mxlen.size,
+          isBackdoorWritable: false,
         ),
         CsrInstanceConfig(
           arch: SimpleRwCsr('sscratch'),
           addr: CsrAddress.sscratch.address,
           resetValue: 0,
           width: mxlen.size,
+          isBackdoorWritable: false,
         ),
         CsrInstanceConfig(
           arch: SimpleRwCsr('sepc'),
           addr: CsrAddress.sepc.address,
           resetValue: 0,
           width: mxlen.size,
+          isBackdoorWritable: false,
         ),
         CsrInstanceConfig(
           arch: SimpleRwCsr('scause'),
           addr: CsrAddress.scause.address,
           resetValue: 0,
           width: mxlen.size,
+          isBackdoorWritable: false,
         ),
         CsrInstanceConfig(
           arch: SimpleRwCsr('stval'),
           addr: CsrAddress.stval.address,
           resetValue: 0,
           width: mxlen.size,
+          isBackdoorWritable: false,
         ),
         CsrInstanceConfig(
           arch: SimpleRwCsr('satp'),
           addr: CsrAddress.satp.address,
           resetValue: 0,
           width: mxlen.size,
+          isBackdoorWritable: false,
         ),
       ],
 
@@ -377,48 +401,56 @@ class RiscVCsrFile extends Module {
           addr: CsrAddress.ustatus.address,
           resetValue: 0,
           width: mxlen.size,
+          isBackdoorWritable: false,
         ),
         CsrInstanceConfig(
           arch: SimpleRwCsr('uie'),
           addr: CsrAddress.uie.address,
           resetValue: 0,
           width: mxlen.size,
+          isBackdoorWritable: false,
         ),
         CsrInstanceConfig(
           arch: SimpleRwCsr('uip'),
           addr: CsrAddress.uip.address,
           resetValue: 0,
           width: mxlen.size,
+          isBackdoorWritable: false,
         ),
         CsrInstanceConfig(
           arch: SimpleRwCsr('utvec'),
           addr: CsrAddress.utvec.address,
           resetValue: 0,
           width: mxlen.size,
+          isBackdoorWritable: false,
         ),
         CsrInstanceConfig(
           arch: SimpleRwCsr('uscratch'),
           addr: CsrAddress.uscratch.address,
           resetValue: 0,
           width: mxlen.size,
+          isBackdoorWritable: false,
         ),
         CsrInstanceConfig(
           arch: SimpleRwCsr('uepc'),
           addr: CsrAddress.uepc.address,
           resetValue: 0,
           width: mxlen.size,
+          isBackdoorWritable: false,
         ),
         CsrInstanceConfig(
           arch: SimpleRwCsr('ucause'),
           addr: CsrAddress.ucause.address,
           resetValue: 0,
           width: mxlen.size,
+          isBackdoorWritable: false,
         ),
         CsrInstanceConfig(
           arch: SimpleRwCsr('utval'),
           addr: CsrAddress.utval.address,
           resetValue: 0,
           width: mxlen.size,
+          isBackdoorWritable: false,
         ),
       ],
 
@@ -568,17 +600,17 @@ class RiscVCsrFile extends Module {
     _fdRead.addr <= rdAddr12;
     _fdRead.en <= csrRead.en & rdLegal;
     csrRead.data <= _fdRead.data;
-    csrRead.done <= _fdRead.done | csrRead.en;
-    csrRead.valid <= _fdRead.valid & rdLegal;
+    csrRead.done <= _fdRead.done & csrRead.en;
+    csrRead.valid <= _fdRead.valid & csrRead.en & rdLegal;
 
     _fdWrite.addr <= wrAddr12;
 
     final maskedWriteData = _maskWriteData(wrAddr12, csrWrite.data);
     _fdWrite.data <= maskedWriteData;
 
-    _fdWrite.en <= csrWrite.en;
-    csrWrite.done <= _fdWrite.done;
-    csrWrite.valid <= _fdWrite.valid & wrLegal;
+    _fdWrite.en <= csrWrite.en & wrLegal;
+    csrWrite.done <= _fdWrite.done & csrWrite.en;
+    csrWrite.valid <= _fdWrite.valid & csrWrite.en & wrLegal;
   }
 
   void _bindBackdoorForCounters() {
@@ -635,6 +667,12 @@ class RiscVCsrFile extends Module {
     return _csrTop.getBackdoorPortsByAddr(0, address.toInt()).rdData?.value;
   }
 
+  CsrBackdoorInterface getBackdoor(LogicValue address) {
+    assert(address.width == 12);
+
+    return _csrTop.getBackdoorPortsByAddr(0, address.toInt());
+  }
+
   Logic get mvendorid =>
       _csrTop.getBackdoorPortsByAddr(0, CsrAddress.mvendorid.address).rdData!;
   Logic get marchid =>
@@ -668,6 +706,5 @@ class RiscVCsrFile extends Module {
       _csrTop.getBackdoorPortsByAddr(0, CsrAddress.scause.address).rdData!;
   Logic get stval =>
       _csrTop.getBackdoorPortsByAddr(0, CsrAddress.stval.address).rdData!;
-  Logic get satp =>
-      _csrTop.getBackdoorPortsByAddr(0, CsrAddress.satp.address).rdData!;
+  Logic? get satp => hasSupervisor ? output('satp') : null;
 }

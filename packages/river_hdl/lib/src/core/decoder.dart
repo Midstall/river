@@ -5,10 +5,12 @@ import 'package:riscv/riscv.dart';
 abstract class InstructionDecoder extends Module {
   final Mxlen mxlen;
   final Microcode microcode;
+  final List<String> staticInstructions;
 
   Logic get done => output('done');
   Logic get valid => output('valid');
   Logic get index => output('index');
+  Logic get counter => output('counter');
 
   Map<String, Logic> get fields => Map.fromEntries(
     fieldWidths.entries.map(
@@ -24,10 +26,11 @@ abstract class InstructionDecoder extends Module {
     Logic reset,
     Logic enable,
     Logic input, {
+    int counterWidth = 32,
     DataPortInterface? microcodeRead,
     required this.microcode,
     required this.mxlen,
-    List<String> staticInstructions = const [],
+    this.staticInstructions = const [],
     super.name = 'river_instruction_decoder',
   }) {
     clk = addInput('clk', clk);
@@ -50,6 +53,7 @@ abstract class InstructionDecoder extends Module {
     addOutput('valid');
     addOutput('index', width: microcode.opIndexWidth);
     addOutput('imm', width: mxlen.size);
+    addOutput('counter', width: counterWidth);
 
     for (final entry in fieldWidths.entries) {
       if (entry.key == 'imm') continue;
@@ -70,6 +74,7 @@ abstract class InstructionDecoder extends Module {
           valid < 0,
           index < 0,
           done < 0,
+          counter < 0,
           if (microcodeRead != null) ...[
             microcodeRead!.en < 0,
             microcodeRead!.addr < 0,
@@ -82,6 +87,7 @@ abstract class InstructionDecoder extends Module {
           If(
             enable,
             then: [
+              counter < (counter + 1),
               ...decode(input),
               if (microcodeRead != null)
                 ...decodeMicrocode(input, microcodeRead!),
@@ -185,6 +191,7 @@ class DynamicInstructionDecoder extends InstructionDecoder {
     DataPortInterface microcodeRead, {
     required Microcode microcode,
     required Mxlen mxlen,
+    int counterWidth = 32,
     List<String> staticInstructions = const [],
     String name = 'river_dynamic_instruction_decoder',
   }) : super(
@@ -195,6 +202,7 @@ class DynamicInstructionDecoder extends InstructionDecoder {
          microcodeRead: microcodeRead,
          microcode: microcode,
          mxlen: mxlen,
+         counterWidth: counterWidth,
          staticInstructions: staticInstructions,
          name: name,
        );
@@ -330,6 +338,7 @@ class StaticInstructionDecoder extends InstructionDecoder {
     required super.microcode,
     required super.mxlen,
     super.staticInstructions,
+    super.counterWidth = 32,
     super.name = 'river_static_instruction_decoder',
   });
 
@@ -392,21 +401,29 @@ class StaticInstructionDecoder extends InstructionDecoder {
 
   Map<OperationDecodePattern, Logic> lookupDecode(Logic input) =>
       Map.fromEntries(
-        microcode.decodeLookup.entries.map((entry) {
-          final nzfMatch = entry.value.nzfMask == 0
-              ? Const(1)
-              : (input & Const(entry.value.nzfMask, width: 32)).neq(0);
-          final zfMatch = entry.value.zfMask == 0
-              ? Const(1)
-              : (input & Const(entry.value.zfMask, width: 32)).eq(0);
+        microcode.decodeLookup.entries
+            .where(
+              (entry) => staticInstructions.isNotEmpty
+                  ? staticInstructions.contains(
+                      microcode.execLookup[entry.key]!.mnemonic,
+                    )
+                  : true,
+            )
+            .map((entry) {
+              final nzfMatch = entry.value.nzfMask == 0
+                  ? Const(1)
+                  : (input & Const(entry.value.nzfMask, width: 32)).neq(0);
+              final zfMatch = entry.value.zfMask == 0
+                  ? Const(1)
+                  : (input & Const(entry.value.zfMask, width: 32)).eq(0);
 
-          final mask = Const(entry.value.mask, width: 32);
-          final value = Const(entry.value.value, width: 32);
+              final mask = Const(entry.value.mask, width: 32);
+              final value = Const(entry.value.value, width: 32);
 
-          return MapEntry(
-            entry.value,
-            (input & mask).eq(value) & nzfMatch & zfMatch,
-          );
-        }),
+              return MapEntry(
+                entry.value,
+                (input & mask).eq(value) & nzfMatch & zfMatch,
+              );
+            }),
       );
 }
