@@ -127,9 +127,10 @@ class MicroOpEncoding<T extends MicroOp> {
     required this.constructor,
   });
 
-  int encode(T op, Mxlen mxlen) => struct(mxlen).encode(op.toMap());
+  BigInt encode(T op, Mxlen mxlen) => struct(mxlen).bigEncode(op.toMap());
 
-  T decode(int value, Mxlen mxlen) => constructor(struct(mxlen).decode(value));
+  T decode(BigInt value, Mxlen mxlen) =>
+      constructor(struct(mxlen).bigDecode(value));
 }
 
 /// {@category microcode}
@@ -270,6 +271,8 @@ enum MicroOpMemSize {
   final int bytes;
 
   int get bits => bytes * 8;
+
+  static const int width = 2;
 }
 
 /// {@category microcode}
@@ -300,9 +303,9 @@ class WriteCsrMicroOp extends MicroOp {
 
   static BitStruct struct(Mxlen mxlen) => BitStruct({
     'funct': MicroOp.functRange,
-    'field': const BitRange(5, 8),
-    'source': const BitRange(9, 12),
-    'offset': BitRange(13, 13 + mxlen.size),
+    'field': const BitRange(5, 7),
+    'source': const BitRange(8, 10),
+    'offset': BitRange(11, 11 + mxlen.size),
   });
 }
 
@@ -339,9 +342,9 @@ class ReadRegisterMicroOp extends MicroOp {
 
   static BitStruct struct(Mxlen mxlen) => BitStruct({
     'funct': MicroOp.functRange,
-    'source': const BitRange(5, 8),
-    'offset': BitRange(9, 9 + mxlen.size),
-    'valueOffset': BitRange(9 + mxlen.size, 9 + (mxlen.size * 2)),
+    'source': const BitRange(5, 7),
+    'offset': BitRange(8, 8 + mxlen.size - 1),
+    'valueOffset': BitRange(8 + mxlen.size, 8 + (mxlen.size * 2) - 1),
   });
 }
 
@@ -382,10 +385,10 @@ class WriteRegisterMicroOp extends MicroOp {
 
   static BitStruct struct(Mxlen mxlen) => BitStruct({
     'funct': MicroOp.functRange,
-    'field': const BitRange(5, 8),
-    'source': const BitRange(9, 12),
-    'offset': BitRange(13, 13 + mxlen.size),
-    'valueOffset': BitRange(13 + mxlen.size, 13 + (mxlen.size * 2)),
+    'field': const BitRange(5, 7),
+    'source': const BitRange(8, 10),
+    'offset': BitRange(11, 11 + mxlen.size - 1),
+    'valueOffset': BitRange(11 + mxlen.size, 11 + (mxlen.size * 2) - 1),
   });
 }
 
@@ -417,9 +420,9 @@ class ModifyLatchMicroOp extends MicroOp {
 
   static BitStruct struct(Mxlen _) => BitStruct({
     'funct': MicroOp.functRange,
-    'field': const BitRange(5, 8),
-    'source': const BitRange(9, 12),
-    'replace': BitRange.single(13),
+    'field': const BitRange(5, 7),
+    'source': const BitRange(8, 10),
+    'replace': BitRange.single(11),
   });
 }
 
@@ -451,9 +454,9 @@ class AluMicroOp extends MicroOp {
 
   static BitStruct struct(Mxlen _) => BitStruct({
     'funct': MicroOp.functRange,
-    'alu': const BitRange(5, 10),
-    'a': const BitRange(11, 14),
-    'b': const BitRange(15, 18),
+    'alu': const BitRange(5, 9),
+    'a': const BitRange(10, 12),
+    'b': const BitRange(13, 15),
   });
 }
 
@@ -497,11 +500,11 @@ class BranchIfMicroOp extends MicroOp {
 
   static BitStruct struct(Mxlen mxlen) => BitStruct({
     'funct': MicroOp.functRange,
-    'condition': const BitRange(5, 10),
-    'target': const BitRange(11, 14),
-    'hasField': const BitRange.single(15),
-    'offsetField': const BitRange(16, 19),
-    'offset': BitRange(20, 20 + mxlen.size),
+    'condition': const BitRange(5, 7),
+    'target': const BitRange(8, 10),
+    'hasField': const BitRange.single(11),
+    'offsetField': const BitRange(12, 14),
+    'offset': BitRange(15, 15 + mxlen.size - 1),
   });
 }
 
@@ -559,11 +562,11 @@ class UpdatePCMicroOp extends MicroOp {
     'source': const BitRange(5, 8),
     'hasSource': const BitRange.single(9),
     'hasField': const BitRange.single(10),
-    'offsetField': const BitRange(11, 14),
-    'offsetSource': const BitRange(15, 17),
-    'absolute': const BitRange.single(18),
-    'align': const BitRange.single(19),
-    'offset': BitRange(20, 20 + mxlen.size),
+    'offsetField': const BitRange(11, 13),
+    'offsetSource': const BitRange(14, 16),
+    'absolute': const BitRange.single(17),
+    'align': const BitRange.single(18),
+    'offset': BitRange(19, 19 + mxlen.size - 1),
   });
 }
 
@@ -604,10 +607,10 @@ class MemLoadMicroOp extends MicroOp {
 
   static BitStruct struct(Mxlen _) => BitStruct({
     'funct': MicroOp.functRange,
-    'base': const BitRange(5, 8),
-    'dest': const BitRange(9, 12),
-    'size': const BitRange(13, 14),
-    'unsigned': BitRange.single(15),
+    'base': const BitRange(5, 7),
+    'dest': const BitRange(8, 10),
+    'size': const BitRange(11, 12),
+    'unsigned': BitRange.single(13),
   });
 }
 
@@ -643,9 +646,9 @@ class MemStoreMicroOp extends MicroOp {
 
   static BitStruct struct(Mxlen _) => BitStruct({
     'funct': MicroOp.functRange,
-    'base': const BitRange(5, 8),
-    'src': const BitRange(9, 12),
-    'size': const BitRange(13, 14),
+    'base': const BitRange(5, 7),
+    'src': const BitRange(8, 10),
+    'size': const BitRange(11, 12),
   });
 }
 
@@ -672,10 +675,8 @@ class TrapMicroOp extends MicroOp {
   Map<String, int> toMap() => {
     'funct': funct,
     'machine': kindMachine.index,
-    'hasSupervisor': kindSupervisor != null ? 1 : 0,
-    'supervisor': kindSupervisor?.index ?? 0,
-    'hasUser': kindUser != null ? 1 : 0,
-    'user': kindUser?.index ?? 0,
+    'supervisor': kindSupervisor?.index ?? kindMachine.index,
+    'user': kindSupervisor?.index ?? kindMachine.index,
   };
 
   @override
@@ -685,12 +686,9 @@ class TrapMicroOp extends MicroOp {
 
   static BitStruct struct(Mxlen _) => BitStruct({
     'funct': MicroOp.functRange,
-    // 8 bits per trap kind
-    'machine': const BitRange(5, 12),
-    'supervisor': const BitRange(13, 20),
-    'user': const BitRange(21, 28),
-    'hasSupervisor': BitRange.single(29),
-    'hasUser': BitRange.single(30),
+    'machine': const BitRange(5, 9),
+    'supervisor': const BitRange(10, 14),
+    'user': const BitRange(15, 19),
   });
 }
 
@@ -808,8 +806,8 @@ class WriteLinkRegisterMicroOp extends MicroOp {
 
   static BitStruct struct(Mxlen mxlen) => BitStruct({
     'funct': MicroOp.functRange,
-    'link': const BitRange(5, 7),
-    'pcOffset': BitRange(8, 8 + mxlen.size),
+    'link': const BitRange.single(5),
+    'pcOffset': BitRange(6, 6 + mxlen.size - 1),
   });
 }
 
@@ -984,9 +982,9 @@ class ValidateFieldMicroOp extends MicroOp {
 
   static BitStruct struct(Mxlen mxlen) => BitStruct({
     'funct': MicroOp.functRange,
-    'condition': const BitRange(5, 8),
-    'field': const BitRange(9, 12),
-    'value': BitRange(12, 12 + mxlen.size),
+    'condition': const BitRange(5, 7),
+    'field': const BitRange(8, 10),
+    'value': BitRange(10, 10 + mxlen.size - 1),
   });
 }
 
@@ -1015,8 +1013,8 @@ class SetFieldMicroOp extends MicroOp {
 
   static BitStruct struct(Mxlen mxlen) => BitStruct({
     'funct': MicroOp.functRange,
-    'field': const BitRange(5, 8),
-    'value': BitRange(9, 9 + mxlen.size),
+    'field': const BitRange(5, 7),
+    'value': BitRange(8, 8 + mxlen.size - 1),
   });
 }
 
@@ -1035,11 +1033,10 @@ class ReadCsrMicroOp extends MicroOp {
   @override
   String toString() => 'ReadCsrMicroOp($source)';
 
-  // NOTE: must be unique, SetField uses 21
   static const int funct = 22;
 
   static BitStruct struct(Mxlen _) =>
-      BitStruct({'funct': MicroOp.functRange, 'source': const BitRange(5, 8)});
+      BitStruct({'funct': MicroOp.functRange, 'source': const BitRange(5, 7)});
 }
 
 class OperationDecodePattern {
@@ -1268,20 +1265,24 @@ class Operation<T extends InstructionType> {
 
   bool matches(InstructionType instr) => _mapMatch(instr.toMap());
 
-  int microcodeWidth(Mxlen mxlen) => microcode
+  int mopWidth(Mxlen mxlen) => microcode
       .map((mop) {
         final m = mop.toMap();
         final funct = m['funct']!;
         final e = kMicroOpTable.firstWhere((e) => e.funct == funct);
-        final s = e.struct(mxlen);
-
-        for (final field in s.mapping.entries) {
-          m[field.key] = field.value.mask;
-        }
-
-        return s.encode(m).bitLength;
+        return e.struct(mxlen).width;
       })
       .fold(0, (a, b) => a > b ? a : b);
+
+  List<BigInt> mopEncode(Mxlen mxlen) => [
+    BigInt.from(microcode.length),
+    ...microcode.map((mop) {
+      final m = mop.toMap();
+      final funct = m['funct']!;
+      final e = kMicroOpTable.firstWhere((e) => e.funct == funct);
+      return e.struct(mxlen).bigEncode(m);
+    }),
+  ];
 
   @override
   String toString() =>
@@ -1385,11 +1386,18 @@ class Microcode {
     fieldIndices,
   ).width;
 
-  int get opIndexWidth => decodeLookup.keys.fold(0, (a, b) => a > b ? a : b);
+  int get opIndexWidth =>
+      decodeLookup.keys.fold(0, (a, b) => a > b ? a : b).bitLength;
 
-  int opWidth(Mxlen mxlen) => map.values
-      .map((op) => op.microcodeWidth(mxlen))
+  int mopWidth(Mxlen mxlen) => map.values
+      .map((op) => op.mopWidth(mxlen))
       .fold(0, (a, b) => a > b ? a : b);
+
+  int mopIndexWidth(Mxlen mxlen) => encodedMops(mxlen).length.bitLength;
+
+  List<BigInt> encodedMops(Mxlen mxlen) => map.values
+      .map((m) => m.mopEncode(mxlen))
+      .fold([], (a, b) => [...a, ...b]);
 
   Map<int, OperationDecodePattern> get decodeLookup {
     Map<int, OperationDecodePattern> result = {};
@@ -1620,5 +1628,10 @@ class Microcode {
   static String instrType<T extends InstructionType>(Operation<T> i) {
     final name = i.runtimeType.toString();
     return name.substring(10, name.length - 1);
+  }
+
+  static String mopType<T extends MicroOp>(MicroOpEncoding<T> i) {
+    final name = i.runtimeType.toString();
+    return name.substring(16, name.length - 8);
   }
 }

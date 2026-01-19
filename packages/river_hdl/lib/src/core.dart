@@ -24,6 +24,7 @@ class RiverCoreIP extends BridgeModule {
   RiverCoreIP(
     this.config, {
     Map<String, Logic> srcIrqs = const {},
+    List<String> staticInstructions = const [],
     super.name = 'river_core',
   }) : super('RiverCore') {
     createPort('clk', PortDirection.input);
@@ -239,13 +240,31 @@ class RiverCoreIP extends BridgeModule {
           )
         : null;
 
-    if (csrs != null) {
+    if (csrs != null && csrs.satp != null) {
+      pagingMode <=
+          (((csrs.satp! >>
+                      Const(
+                        config.mxlen.satpModeShift,
+                        width: config.mxlen.size,
+                      )) &
+                  Const(config.mxlen.satpModeMask, width: config.mxlen.size)))
+              .slice(pagingMode.width - 1, 0);
+      pageTableAddress <=
+          (csrs.satp! &
+              Const(config.mxlen.satpPpnMask, width: config.mxlen.size));
+    } else {
       pagingMode <= Const(0, width: pagingMode.width);
       pageTableAddress <= Const(0, width: config.mxlen.size);
-      // TODO: drive pagingMode, pageTableAddress, mxr, and sum from CSRs
     }
 
-    final microcodeRead = DataPortInterface(
+    if (csrs != null) {
+      enableMxr <=
+          ((csrs.mstatus >> 19) & Const(1, width: config.mxlen.size)).neq(0);
+      enableSum <=
+          ((csrs.mstatus >> 18) & Const(1, width: config.mxlen.size)).neq(0);
+    }
+
+    final microcodeDecodeRead = DataPortInterface(
       config.microcode.patternWidth,
       config.microcode.map.length.bitLength,
     );
@@ -255,10 +274,29 @@ class RiverCoreIP extends BridgeModule {
         clk,
         reset,
         [],
-        [microcodeRead],
+        [microcodeDecodeRead],
         numEntries: config.microcode.map.length,
         resetValue: config.microcode.encodedPatterns,
         definitionName: 'RiverMicrocodeLookup',
+      );
+    }
+
+    final microcodeExecRead = DataPortInterface(
+      config.microcode.mopWidth(config.mxlen),
+      config.microcode.mopIndexWidth(config.mxlen),
+    );
+
+    if (config.microcodeMode.onExec != MicrocodePipelineMode.none) {
+      final mops = config.microcode.encodedMops(config.mxlen);
+
+      RegisterFile(
+        clk,
+        reset,
+        [],
+        [microcodeExecRead],
+        numEntries: mops.length,
+        resetValue: mops,
+        definitionName: 'RiverMicrocodeOperations',
       );
     }
 
@@ -279,10 +317,15 @@ class RiverCoreIP extends BridgeModule {
       rs2Read,
       rdWrite,
       config.microcodeMode.onDecoder != MicrocodePipelineMode.none
-          ? microcodeRead
+          ? microcodeDecodeRead
+          : null,
+      config.microcodeMode.onExec != MicrocodePipelineMode.none
+          ? microcodeExecRead
           : null,
       useMixedDecoders:
           config.microcodeMode.onDecoder == MicrocodePipelineMode.in_parallel,
+      useMixedExecution:
+          config.microcodeMode.onExec == MicrocodePipelineMode.in_parallel,
       microcode: config.microcode,
       mxlen: config.mxlen,
       hasSupervisor: config.hasSupervisor,
@@ -292,6 +335,7 @@ class RiverCoreIP extends BridgeModule {
       medeleg: csrs?.medeleg,
       mtvec: csrs?.mtvec,
       stvec: csrs?.stvec,
+      staticInstructions: staticInstructions,
     );
 
     Sequential(clk, [

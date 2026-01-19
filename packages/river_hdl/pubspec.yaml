@@ -20,7 +20,6 @@ dependencies:
     git:
       url: https://github.com/MidstallSoftware/rohd-hcl.git
       ref: integration
-  # path: ^1.9.0
 
 dev_dependencies:
   lints: ^6.0.0

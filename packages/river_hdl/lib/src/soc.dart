@@ -13,6 +13,7 @@ class RiverSoCIP extends BridgeModule {
     this.config, {
     Map<String, Map<String, String>> deviceOptions = const {},
     Map<String, DeviceModuleFactory> deviceFactory = kDeviceModuleFactory,
+    List<String> staticInstructions = const [],
   }) : super('RiverSoC') {
     createPort('reset', PortDirection.input);
 
@@ -71,7 +72,9 @@ class RiverSoCIP extends BridgeModule {
     for (final coreConfig in config.cores) {
       final clk = port('clk_${coreConfig.clock.name}');
 
-      final core = addSubModule(RiverCoreIP(coreConfig));
+      final core = addSubModule(
+        RiverCoreIP(coreConfig, staticInstructions: staticInstructions),
+      );
 
       connectPorts(clk, core.port('clk'));
       connectPorts(reset, core.port('reset'));

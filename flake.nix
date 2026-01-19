@@ -168,6 +168,7 @@
                     icestorm
                     nextpnr
                     gtkwave
+                    surfer
                     pkgsCross.riscv32-embedded.stdenv.cc
                     pkgsCross.riscv64-embedded.stdenv.cc
                   ]

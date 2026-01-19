@@ -19,6 +19,7 @@ Future<void> execTest(
   Map<Register, int> initRegisters = const {},
   int nextPc = 4,
   int memLatency = 0,
+  bool isDynamic = false,
 }) async {
   final clk = SimpleClockGenerator(20).clk;
   final reset = Logic();
@@ -92,30 +93,70 @@ Future<void> execTest(
     numEntries: 32,
   );
 
-  final exec = ExecutionUnit(
+  final microcodeRead = DataPortInterface(
+    microcode.mopWidth(mxlen),
+    microcode.mopIndexWidth(mxlen),
+  );
+
+  RegisterFile(
     clk,
     reset,
-    decoder.valid & decoder.done,
-    Const(0, width: mxlen.size),
-    Const(0, width: mxlen.size),
-    mode,
-    decoder.index,
-    decoder.instrTypeMap,
-    decoder.fields,
-    csrRead,
-    csrWrite,
-    memRead,
-    memWrite,
-    rs1Read,
-    rs2Read,
-    rdWrite,
-    microcode: microcode,
-    mxlen: mxlen,
-    mideleg: csrs.mideleg,
-    medeleg: csrs.medeleg,
-    mtvec: csrs.mtvec,
-    stvec: csrs.stvec,
+    [],
+    [microcodeRead],
+    numEntries: microcode.encodedMops(mxlen).length,
+    resetValue: microcode.encodedMops(mxlen),
   );
+
+  final exec = isDynamic
+      ? DynamicExecutionUnit(
+          clk,
+          reset,
+          decoder.valid & decoder.done,
+          Const(0, width: mxlen.size),
+          Const(0, width: mxlen.size),
+          mode,
+          decoder.index,
+          decoder.instrTypeMap,
+          decoder.fields,
+          csrRead,
+          csrWrite,
+          memRead,
+          memWrite,
+          rs1Read,
+          rs2Read,
+          rdWrite,
+          microcodeRead,
+          microcode: microcode,
+          mxlen: mxlen,
+          mideleg: csrs.mideleg,
+          medeleg: csrs.medeleg,
+          mtvec: csrs.mtvec,
+          stvec: csrs.stvec,
+        )
+      : StaticExecutionUnit(
+          clk,
+          reset,
+          decoder.valid & decoder.done,
+          Const(0, width: mxlen.size),
+          Const(0, width: mxlen.size),
+          mode,
+          decoder.index,
+          decoder.instrTypeMap,
+          decoder.fields,
+          csrRead,
+          csrWrite,
+          memRead,
+          memWrite,
+          rs1Read,
+          rs2Read,
+          rdWrite,
+          microcode: microcode,
+          mxlen: mxlen,
+          mideleg: csrs.mideleg,
+          medeleg: csrs.medeleg,
+          mtvec: csrs.mtvec,
+          stvec: csrs.stvec,
+        );
 
   await exec.build();
 
@@ -157,6 +198,13 @@ Future<void> execTest(
     await clk.nextPosedge;
   }
 
+  for (final csrState in initCsrs.entries) {
+    csrs
+        .getBackdoor(LogicValue.ofInt(csrState.key.address, 12))
+        .wrEn!
+        .inject(0);
+  }
+
   while (!exec.done.value.toBool()) {
     await clk.nextPosedge;
   }
@@ -165,17 +213,20 @@ Future<void> execTest(
     await clk.nextPosedge;
   }
 
+  await clk.nextPosedge;
+
   await Simulator.endSimulation();
   await Simulator.simulationEnded;
 
   expect(exec.done.value.toBool(), isTrue);
+  expect(exec.valid.value.toBool(), isTrue);
   expect(exec.nextPc.value.toInt(), nextPc);
 
   for (final regState in regStates.entries) {
-    expect(
-      regs.getData(LogicValue.ofInt(regState.key.value, 5))!.toInt(),
-      regState.value,
-    );
+    final value = regs
+        .getData(LogicValue.ofInt(regState.key.value, 5))!
+        .toInt();
+    expect(value, regState.value, reason: '${regState.key}=$value');
   }
 
   for (final memState in memStates.entries) {
@@ -186,10 +237,10 @@ Future<void> execTest(
   }
 
   for (final csrState in csrStates.entries) {
-    expect(
-      csrs.getData(LogicValue.ofInt(csrState.key.address, 12))!.toInt(),
-      csrState.value,
-    );
+    final value = csrs
+        .getData(LogicValue.ofInt(csrState.key.address, 12))!
+        .toInt();
+    expect(value, csrState.value, reason: '${csrState.key}=$value');
   }
 }
 
@@ -198,217 +249,245 @@ void main() {
     await Simulator.reset();
   });
 
-  group('RV32I', () {
-    final microcode = Microcode(Microcode.buildDecodeMap([rv32i]));
+  void define(bool isDynamic) {
+    group('RV32I', () {
+      final microcode = Microcode(Microcode.buildDecodeMap([rv32i]));
 
-    test(
-      'addi increments register',
-      () => execTest(0x00a08293, {Register.x5: 10}, microcode, Mxlen.mxlen_32),
-    );
+      test(
+        'addi increments register',
+        () => execTest(
+          0x00a08293,
+          {Register.x5: 10},
+          microcode,
+          Mxlen.mxlen_32,
+          isDynamic: isDynamic,
+        ),
+      );
 
-    test(
-      'add performs register addition',
-      () => execTest(
-        0x005303B3,
-        {Register.x7: 16},
-        microcode,
-        Mxlen.mxlen_32,
-        initRegisters: {Register.x5: 7, Register.x6: 9},
-      ),
-    );
+      test(
+        'add performs register addition',
+        () => execTest(
+          0x005303B3,
+          {Register.x7: 16},
+          microcode,
+          Mxlen.mxlen_32,
+          initRegisters: {Register.x5: 7, Register.x6: 9},
+          isDynamic: isDynamic,
+        ),
+      );
 
-    test(
-      'lw loads from memory',
-      () => execTest(
-        0x0042A303,
-        {Register.x6: 0xDEADBEEF},
-        microcode,
-        Mxlen.mxlen_32,
-        initRegisters: {Register.x5: 0x20},
-        initMem: {0x24: 0xDEADBEEF},
-      ),
-    );
+      test(
+        'lw loads from memory',
+        () => execTest(
+          0x0042A303,
+          {Register.x6: 0xDEADBEEF},
+          microcode,
+          Mxlen.mxlen_32,
+          initRegisters: {Register.x5: 0x20},
+          initMem: {0x24: 0xDEADBEEF},
+          isDynamic: isDynamic,
+        ),
+      );
 
-    test(
-      'sw stores to memory',
-      () => execTest(
-        0x0062A223,
-        {},
-        microcode,
-        Mxlen.mxlen_32,
-        initRegisters: {Register.x5: 0x20, Register.x6: 0xDEADBEEF},
-        initMem: {},
-      ),
-    );
+      test(
+        'sw stores to memory',
+        () => execTest(
+          0x0062A223,
+          {},
+          microcode,
+          Mxlen.mxlen_32,
+          initRegisters: {Register.x5: 0x20, Register.x6: 0xDEADBEEF},
+          initMem: {},
+          isDynamic: isDynamic,
+        ),
+      );
 
-    test(
-      'beq takes branch when equal',
-      () => execTest(
-        0x00628463,
-        {},
-        microcode,
-        Mxlen.mxlen_32,
-        initRegisters: {Register.x5: 5, Register.x6: 5},
-        nextPc: 8,
-      ),
-    );
+      test(
+        'beq takes branch when equal',
+        () => execTest(
+          0x00628463,
+          {},
+          microcode,
+          Mxlen.mxlen_32,
+          initRegisters: {Register.x5: 5, Register.x6: 5},
+          nextPc: 8,
+          isDynamic: isDynamic,
+        ),
+      );
 
-    test(
-      'beq does not branch when not equal',
-      () => execTest(
-        0x00628463,
-        {},
-        microcode,
-        Mxlen.mxlen_32,
-        initRegisters: {Register.x5: 5, Register.x6: 7},
-        nextPc: 4,
-      ),
-    );
+      test(
+        'beq does not branch when not equal',
+        () => execTest(
+          0x00628463,
+          {},
+          microcode,
+          Mxlen.mxlen_32,
+          initRegisters: {Register.x5: 5, Register.x6: 7},
+          nextPc: 4,
+          isDynamic: isDynamic,
+        ),
+      );
 
-    test(
-      'lui loads upper immediate',
-      () => execTest(
-        0x123452B7,
-        {Register.x5: 0x12345000},
-        microcode,
-        Mxlen.mxlen_32,
-      ),
-    );
+      test(
+        'lui loads upper immediate',
+        () => execTest(
+          0x123452B7,
+          {Register.x5: 0x12345000},
+          microcode,
+          Mxlen.mxlen_32,
+          isDynamic: isDynamic,
+        ),
+      );
 
-    test(
-      'jal writes ra and jumps',
-      () => execTest(
-        0x100002EF,
-        {Register.x5: 4},
-        microcode,
-        Mxlen.mxlen_32,
-        nextPc: 0x100,
-      ),
-    );
+      test(
+        'jal writes ra and jumps',
+        () => execTest(
+          0x100002EF,
+          {Register.x5: 4},
+          microcode,
+          Mxlen.mxlen_32,
+          nextPc: 0x100,
+          isDynamic: isDynamic,
+        ),
+      );
 
-    test(
-      'auipc adds immediate to PC',
-      () => execTest(
-        0x00010297,
-        {Register.x5: 0x10000},
-        microcode,
-        Mxlen.mxlen_32,
-      ),
-    );
+      test(
+        'auipc adds immediate to PC',
+        () => execTest(
+          0x00010297,
+          {Register.x5: 0x10000},
+          microcode,
+          Mxlen.mxlen_32,
+          isDynamic: isDynamic,
+        ),
+      );
 
-    test(
-      'slti sets when less-than immediate',
-      () => execTest(
-        0x00A22293,
-        {Register.x5: 1},
-        microcode,
-        Mxlen.mxlen_32,
-        initRegisters: {Register.x4: 5},
-      ),
-    );
-  });
+      test(
+        'slti sets when less-than immediate',
+        () => execTest(
+          0x00A22293,
+          {Register.x5: 1},
+          microcode,
+          Mxlen.mxlen_32,
+          initRegisters: {Register.x4: 5},
+          isDynamic: isDynamic,
+        ),
+      );
+    });
 
-  group('Zicsr', () {
-    final microcode = Microcode(Microcode.buildDecodeMap([rv32i, rv32Zicsr]));
+    group('Zicsr', () {
+      final microcode = Microcode(Microcode.buildDecodeMap([rv32i, rv32Zicsr]));
 
-    test(
-      'csrrw: atomic swap (rd=old, CSR=new)',
-      () => execTest(
-        0x34029373,
-        {Register.x6: 0xAAAA},
-        microcode,
-        Mxlen.mxlen_32,
-        initRegisters: {Register.x5: 0x1234},
-        initCsrs: {CsrAddress.mscratch: 0xAAAA},
-        csrStates: {CsrAddress.mscratch: 0x1234},
-      ),
-    );
+      test(
+        'csrrw: atomic swap (rd=old, CSR=new)',
+        () => execTest(
+          0x34029373,
+          {Register.x6: 0xAAAA},
+          microcode,
+          Mxlen.mxlen_32,
+          initRegisters: {Register.x5: 0x1234},
+          initCsrs: {CsrAddress.mscratch: 0xAAAA},
+          csrStates: {CsrAddress.mscratch: 0x1234},
+          isDynamic: isDynamic,
+        ),
+      );
 
-    test(
-      'csrrw with rd=x0 still writes CSR but suppresses rd write',
-      () => execTest(
-        0x34029073,
-        {Register.x0: 0},
-        microcode,
-        Mxlen.mxlen_32,
-        initRegisters: {Register.x5: 0x2222},
-        initCsrs: {CsrAddress.mscratch: 0x1111},
-        csrStates: {CsrAddress.mscratch: 0x2222},
-      ),
-    );
+      test(
+        'csrrw with rd=x0 still writes CSR but suppresses rd write',
+        () => execTest(
+          0x34029073,
+          {Register.x0: 0},
+          microcode,
+          Mxlen.mxlen_32,
+          initRegisters: {Register.x5: 0x2222},
+          initCsrs: {CsrAddress.mscratch: 0x1111},
+          csrStates: {CsrAddress.mscratch: 0x2222},
+          isDynamic: isDynamic,
+        ),
+      );
 
-    test(
-      'csrrs: rd=old, CSR |= rs1',
-      () => execTest(
-        0x3402A373,
-        {Register.x6: 0x100},
-        microcode,
-        Mxlen.mxlen_32,
-        initRegisters: {Register.x5: 0x0F},
-        initCsrs: {CsrAddress.mscratch: 0x100},
-        csrStates: {CsrAddress.mscratch: 0x10F},
-      ),
-    );
+      test(
+        'csrrs: rd=old, CSR |= rs1',
+        () => execTest(
+          0x3402A373,
+          {Register.x6: 0x100},
+          microcode,
+          Mxlen.mxlen_32,
+          initRegisters: {Register.x5: 0x0F},
+          initCsrs: {CsrAddress.mscratch: 0x100},
+          csrStates: {CsrAddress.mscratch: 0x10F},
+          isDynamic: isDynamic,
+        ),
+      );
 
-    test(
-      'csrrs with rs1=x0 only reads CSR',
-      () => execTest(
-        0x3400A073,
-        {},
-        microcode,
-        Mxlen.mxlen_32,
-        initCsrs: {CsrAddress.mscratch: 0xABCDE},
-        csrStates: {CsrAddress.mscratch: 0xABCDE},
-      ),
-    );
+      test(
+        'csrrs with rs1=x0 only reads CSR',
+        () => execTest(
+          0x3400A073,
+          {},
+          microcode,
+          Mxlen.mxlen_32,
+          initCsrs: {CsrAddress.mscratch: 0xABCDE},
+          csrStates: {CsrAddress.mscratch: 0xABCDE},
+          isDynamic: isDynamic,
+        ),
+      );
 
-    test(
-      'csrrc: CSR &= ~rs1',
-      () => execTest(
-        0x3402B373,
-        {Register.x6: 0xFF},
-        microcode,
-        Mxlen.mxlen_32,
-        initRegisters: {Register.x5: 0x0F},
-        initCsrs: {CsrAddress.mscratch: 0xFF},
-        csrStates: {CsrAddress.mscratch: 0xF0},
-      ),
-    );
+      test(
+        'csrrc: CSR &= ~rs1',
+        () => execTest(
+          0x3402B373,
+          {Register.x6: 0xFF},
+          microcode,
+          Mxlen.mxlen_32,
+          initRegisters: {Register.x5: 0x0F},
+          initCsrs: {CsrAddress.mscratch: 0xFF},
+          csrStates: {CsrAddress.mscratch: 0xF0},
+          isDynamic: isDynamic,
+        ),
+      );
 
-    test(
-      'csrrwi: CSR = imm, rd = old CSR',
-      () => execTest(
-        0x3402D373,
-        {Register.x6: 0x7777},
-        microcode,
-        Mxlen.mxlen_32,
-        initCsrs: {CsrAddress.mscratch: 0x7777},
-        csrStates: {CsrAddress.mscratch: 5},
-      ),
-    );
+      test(
+        'csrrwi: CSR = imm, rd = old CSR',
+        () => execTest(
+          0x3402D373,
+          {Register.x6: 0x7777},
+          microcode,
+          Mxlen.mxlen_32,
+          initCsrs: {CsrAddress.mscratch: 0x7777},
+          csrStates: {CsrAddress.mscratch: 5},
+          isDynamic: isDynamic,
+        ),
+      );
 
-    test(
-      'csrrsi: CSR |= imm',
-      () => execTest(
-        0x3401E073,
-        {},
-        microcode,
-        Mxlen.mxlen_32,
-        initCsrs: {CsrAddress.mscratch: 0x10},
-        csrStates: {CsrAddress.mscratch: 0x13},
-      ),
-    );
+      test(
+        'csrrsi: CSR |= imm',
+        () => execTest(
+          0x3401E073,
+          {},
+          microcode,
+          Mxlen.mxlen_32,
+          initCsrs: {CsrAddress.mscratch: 0x10},
+          csrStates: {CsrAddress.mscratch: 0x13},
+          isDynamic: isDynamic,
+        ),
+      );
 
-    test(
-      'csrrsi: CSR &= ~imm',
-      () => execTest(
-        0x3401F073,
-        {},
-        microcode,
-        Mxlen.mxlen_32,
-        initCsrs: {CsrAddress.mscratch: 0xF},
-        csrStates: {CsrAddress.mscratch: 0xC},
-      ),
-    );
-  });
+      test(
+        'csrrsi: CSR &= ~imm',
+        () => execTest(
+          0x3401F073,
+          {},
+          microcode,
+          Mxlen.mxlen_32,
+          initCsrs: {CsrAddress.mscratch: 0xF},
+          csrStates: {CsrAddress.mscratch: 0xC},
+          isDynamic: isDynamic,
+        ),
+      );
+    });
+  }
+
+  group('Static execution', () => define(false));
+  group('Dynamic execution', () => define(true));
 }
