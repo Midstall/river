@@ -15,8 +15,3 @@ jobs:
       contents: read
     with:
       visibility: public
-      runner-map: |
-        {
-          "aarch64-darwin": "macos-latest",
-          "x86_64-linux": "ubuntu-latest"
-        }

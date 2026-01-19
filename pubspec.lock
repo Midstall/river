@@ -97,14 +97,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "9.0.2"
-  ffi:
-    dependency: transitive
-    description:
-      name: ffi
-      sha256: d07d37192dbf97461359c1518788f203b0c9102cfd2c35a716b823741219542c
-      url: "https://pub.dev"
-    source: hosted
-    version: "2.1.5"
   file:
     dependency: transitive
     description:
@@ -458,14 +450,5 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "3.1.3"
-  z3:
-    dependency: transitive
-    description:
-      path: dz3
-      ref: HEAD
-      resolved-ref: "0c12f8fe10d064df5aca0794ed86398bec224471"
-      url: "https://github.com/pingbird/dz3"
-    source: git
-    version: "0.1.0"
 sdks:
   dart: ">=3.9.4 <4.0.0"
