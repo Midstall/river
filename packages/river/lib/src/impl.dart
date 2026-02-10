@@ -7,6 +7,7 @@ export 'impl/devices.dart';
 export 'impl/soc.dart';
 
 enum RiverPlatformChoice {
+  alpha('alpha', RiverSoCChoice.creek_v1),
   icesugar('icesugar', RiverSoCChoice.stream_v1);
 
   const RiverPlatformChoice(this.name, this.soc);

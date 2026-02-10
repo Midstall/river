@@ -196,6 +196,19 @@ class MmuEmulator {
     );
 
     if (entry != null) {
+      if (entry.value.config.type == DeviceAccessorType.mixed) {
+        final laddr = addr - entry.key.start;
+        if (entry.value.config.ioRange != null) {
+          if (laddr >= entry.value.config.ioRange!.start &&
+              laddr <= entry.value.config.ioRange!.end)
+            return false;
+        }
+        if (entry.value.config.memoryRange != null) {
+          if (laddr >= entry.value.config.memoryRange!.start &&
+              laddr <= entry.value.config.memoryRange!.end)
+            return true;
+        }
+      }
       return entry.value.config.type == DeviceAccessorType.memory;
     }
 
