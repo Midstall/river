@@ -25,17 +25,21 @@ class DeviceField {
   String toString() => 'DeviceField($name, $width, offset: $offset)';
 }
 
-enum DeviceAccessorType { memory, io }
+enum DeviceAccessorType { memory, io, mixed }
 
 class DeviceAccessor {
   final String path;
   final Map<int, DeviceField> fields;
   final DeviceAccessorType type;
+  final BusAddressRange? memoryRange;
+  final BusAddressRange? ioRange;
 
   const DeviceAccessor(
     this.path,
     this.fields, {
     this.type = DeviceAccessorType.io,
+    this.memoryRange,
+    this.ioRange,
   });
 
   int? fieldAddress(String name) {
