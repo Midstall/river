@@ -1,4 +1,3 @@
-import 'package:riscv/riscv.dart';
 import 'package:river/river.dart';
 import 'package:river_emulator/river_emulator.dart';
 import 'package:test/test.dart';
@@ -7,25 +6,21 @@ import '../../constants.dart';
 
 void main() {
   cpuTests('M extension', (config) {
-    late SramEmulator sram;
-    late RiverCoreEmulator core;
+    late Sram sram;
+    late RiverCore core;
     late int pc;
 
     setUp(() {
-      sram = SramEmulator(
-        Device.simple(
+      sram = Sram(
+        RiverDevice(
           name: 'sram',
           compatible: 'river,sram',
           range: BusAddressRange(0, 0xFFFF),
-          fields: const {0: DeviceField('data', 4)},
-          clock: config.clock,
+          clockFrequency: (config.clock.rate as HarborFixedClockRate).frequency,
         ),
       );
 
-      core = RiverCoreEmulator(
-        config,
-        memDevices: Map.fromEntries([sram.mem!]),
-      );
+      core = RiverCore(config, memDevices: Map.fromEntries([sram.mem!]));
       pc = config.resetVector;
     });
 
@@ -106,9 +101,12 @@ void main() {
       final divu = 0x025353b3;
       await core.cycle(pc, divu);
 
+      // All-ones in the emulator's Dart-int convention: toSigned(64) maps the
+      // 64-bit all-ones to -1 and leaves the 32-bit value (4294967295) positive.
+      // (Plain .toInt() would clamp the 64-bit value to maxInt - that was a bug.)
       expect(
         core.xregs[Register.x7],
-        ((BigInt.one << config.mxlen.size) - BigInt.one).toInt(),
+        ((BigInt.one << config.mxlen.size) - BigInt.one).toSigned(64).toInt(),
       );
     });
 
@@ -122,7 +120,7 @@ void main() {
       expect(core.xregs[Register.x7], -42);
     });
 
-    if (config.mxlen == Mxlen.mxlen_64) {
+    if (config.mxlen == RiscVMxlen.rv64) {
       test('mulw uses 32-bit product and sign-extends to XLEN', () async {
         core.xregs[Register.x5] = 2;
         core.xregs[Register.x6] = 0x00000000FFFFFFFF;

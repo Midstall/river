@@ -5,14 +5,14 @@ resolution: workspace
 # repository: https://github.com/my_org/my_repo
 
 environment:
-  sdk: ^3.9.3
+  sdk: ^3.11.2
 
 # Add regular dependencies here.
 dependencies:
   args: ^2.7.0
   bintools: ^1.0.0
+  harbor: ^0.0.1
   path: ^1.9.1
-  riscv: ^1.0.0
   river: ^1.0.0
 
 dev_dependencies:

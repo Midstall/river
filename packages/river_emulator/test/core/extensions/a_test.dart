@@ -1,53 +1,57 @@
-import 'package:riscv/riscv.dart';
 import 'package:river/river.dart';
 import 'package:river_emulator/river_emulator.dart';
 import 'package:test/test.dart';
 
 import '../../constants.dart';
 
+// AMO instruction builder: funct7[31:25] | rs2[24:20] | rs1[19:15] | funct3[14:12] | rd[11:7] | opcode[6:0]
+int _amo(int funct7, int rs2, int rs1, int funct3, int rd) =>
+    (funct7 << 25) |
+    (rs2 << 20) |
+    (rs1 << 15) |
+    (funct3 << 12) |
+    (rd << 7) |
+    0x2F;
+
 void main() {
   cpuTests('A extension', (config) {
-    late SramEmulator sram;
-    late RiverCoreEmulator core;
+    late Sram sram;
+    late RiverCore core;
     late int pc;
 
     setUp(() {
-      sram = SramEmulator(
-        Device.simple(
+      sram = Sram(
+        RiverDevice(
           name: 'sram',
           compatible: 'river,sram',
           range: BusAddressRange(0, 0xFFFF),
-          fields: const {0: DeviceField('data', 4)},
-          clock: config.clock,
+          clockFrequency: (config.clock.rate as HarborFixedClockRate).frequency,
         ),
       );
 
-      core = RiverCoreEmulator(
-        config,
-        memDevices: Map.fromEntries([sram.mem!]),
-      );
+      core = RiverCore(config, memDevices: Map.fromEntries([sram.mem!]));
       pc = config.resetVector;
     });
 
     Future<void> writeWord(int addr, int value) =>
-        core.mmu.write(addr, value, MicroOpMemSize.word.bytes);
+        core.mmu.write(addr, value, 4);
 
-    Future<int> readWord(int addr) =>
-        core.mmu.read(addr, MicroOpMemSize.word.bytes);
+    Future<int> readWord(int addr) => core.mmu.read(addr, 4);
 
     Future<void> writeDword(int addr, int value) =>
-        core.mmu.write(addr, value, MicroOpMemSize.dword.bytes);
+        core.mmu.write(addr, value, 8);
 
-    Future<int> readDword(int addr) =>
-        core.mmu.read(addr, MicroOpMemSize.dword.bytes);
+    Future<int> readDword(int addr) => core.mmu.read(addr, 8);
+
+    // funct7 = funct5<<2: lr=0x08, sc=0x0C, amoswap=0x04, amoadd=0x00
+    // funct3: word=0x2, dword=0x3
 
     test('lr.w loads a word and reserves the address', () async {
       await writeWord(0x1000, 0x1234);
-      await writeWord(0x1234, 10);
 
       core.xregs[Register.x5] = 0x1000;
 
-      final lrw = 0x1002A0AF;
+      final lrw = _amo(0x08, 0, 5, 2, 1); // lr.w x1, (x5)
       await core.cycle(pc, lrw);
 
       expect(core.xregs[Register.x1], 0x1234);
@@ -59,10 +63,10 @@ void main() {
       core.xregs[Register.x5] = 0x1000;
       core.xregs[Register.x6] = 0x2222;
 
-      final lrw = 0x1002A0AF;
+      final lrw = _amo(0x08, 0, 5, 2, 1); // lr.w x1, (x5)
       await core.cycle(pc, lrw);
 
-      final scw = 0x1862A12F;
+      final scw = _amo(0x0C, 6, 5, 2, 2); // sc.w x2, x6, (x5)
       await core.cycle(pc, scw);
 
       expect(await readWord(0x1000), 0x2222);
@@ -74,12 +78,12 @@ void main() {
       core.xregs[Register.x5] = 0x1000;
       core.xregs[Register.x6] = 0x2222;
 
-      final lrw = 0x1002A0AF;
+      final lrw = _amo(0x08, 0, 5, 2, 1); // lr.w x1, (x5)
       await core.cycle(pc, lrw);
 
       core.clearReservationSet();
 
-      final scw = 0x1862A1AF;
+      final scw = _amo(0x0C, 6, 5, 2, 3); // sc.w x3, x6, (x5)
       await core.cycle(pc, scw);
 
       expect(await readWord(0x1000), 0x1111);
@@ -91,7 +95,7 @@ void main() {
       core.xregs[Register.x5] = 0x1000;
       core.xregs[Register.x6] = 0x5555;
 
-      final amoswap = 0x0862A1AF;
+      final amoswap = _amo(0x04, 6, 5, 2, 3); // amoswap.w x3, x6, (x5)
       await core.cycle(pc, amoswap);
 
       expect(core.xregs[Register.x3], 0xAAAA);
@@ -99,24 +103,23 @@ void main() {
     });
 
     test('amoadd.w adds correctly', () async {
-      writeWord(0x1000, 10);
+      await writeWord(0x1000, 10);
       core.xregs[Register.x5] = 0x1000;
       core.xregs[Register.x6] = 3;
 
-      final amoadd = 0x0062A1AF;
+      final amoadd = _amo(0x00, 6, 5, 2, 3); // amoadd.w x3, x6, (x5)
       await core.cycle(pc, amoadd);
 
       expect(core.xregs[Register.x3], 10);
       expect(await readWord(0x1000), 13);
     });
 
-    if (config.mxlen == Mxlen.mxlen_64) {
+    if (config.mxlen == RiscVMxlen.rv64) {
       test('lr.d loads a doubleword and reserves address', () async {
         await writeDword(0x2000, 0x1122334455667788);
         core.xregs[Register.x5] = 0x2000;
 
-        final lrd = 0x1002B0AF;
-
+        final lrd = _amo(0x08, 0, 5, 3, 1); // lr.d x1, (x5)
         await core.cycle(pc, lrd);
 
         expect(core.xregs[Register.x1], 0x1122334455667788);
@@ -124,14 +127,14 @@ void main() {
       });
 
       test('sc.d succeeds when reservation matches', () async {
-        writeDword(0x2000, 0x1111);
+        await writeDword(0x2000, 0x1111);
         core.xregs[Register.x5] = 0x2000;
         core.xregs[Register.x6] = 0x2222333344445555;
 
-        final lrd = 0x1002B0AF;
+        final lrd = _amo(0x08, 0, 5, 3, 1); // lr.d x1, (x5)
         await core.cycle(pc, lrd);
 
-        final scd = 0x1862B12F;
+        final scd = _amo(0x0C, 6, 5, 3, 2); // sc.d x2, x6, (x5)
         await core.cycle(pc, scd);
 
         expect(await readDword(0x2000), 0x2222333344445555);
@@ -143,12 +146,12 @@ void main() {
         core.xregs[Register.x5] = 0x2000;
         core.xregs[Register.x6] = 0x1111;
 
-        final lrd = 0x1002B0AF;
+        final lrd = _amo(0x08, 0, 5, 3, 1); // lr.d x1, (x5)
         await core.cycle(pc, lrd);
 
         core.clearReservationSet();
 
-        final scd = 0x1862B1AF;
+        final scd = _amo(0x0C, 6, 5, 3, 3); // sc.d x3, x6, (x5)
         await core.cycle(pc, scd);
 
         expect(await readDword(0x2000), 0x9999);

@@ -37,7 +37,6 @@ class Elf {
       case ElfClass.elf64:
         return reader.load64(endian, enc);
       case ElfClass.none:
-      default:
         throw UnsupportedError('Unsupported ELF class: $klass');
     }
   }
@@ -378,9 +377,6 @@ class Elf64ProgramHeader extends ElfProgramHeader {
 
 class Elf32SectionHeader extends ElfSectionHeader {
   @override
-  String? name;
-
-  @override
   final int nameIndex;
 
   @override
@@ -425,9 +421,6 @@ class Elf32SectionHeader extends ElfSectionHeader {
 }
 
 class Elf64SectionHeader extends ElfSectionHeader {
-  @override
-  String? name;
-
   @override
   final int nameIndex;
 

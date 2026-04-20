@@ -1,4 +1,3 @@
-import 'package:riscv/riscv.dart';
 import 'package:river/river.dart';
 import 'package:river_emulator/river_emulator.dart';
 import 'package:test/test.dart';
@@ -7,26 +6,19 @@ import '../constants.dart';
 
 void main() {
   cpuTests('Privilege ISA', (config) {
-    late SramEmulator sram;
-    late RiverCoreEmulator core;
-    late int pc;
-
+    late Sram sram;
+    late RiverCore core;
     setUp(() {
-      sram = SramEmulator(
-        Device.simple(
+      sram = Sram(
+        RiverDevice(
           name: 'sram',
           compatible: 'river,sram',
           range: BusAddressRange(0, 0xFFFF),
-          fields: const {0: DeviceField('data', 4)},
-          clock: config.clock,
+          clockFrequency: (config.clock.rate as HarborFixedClockRate).frequency,
         ),
       );
 
-      core = RiverCoreEmulator(
-        config,
-        memDevices: Map.fromEntries([sram.mem!]),
-      );
-      pc = config.resetVector;
+      core = RiverCore(config, memDevices: Map.fromEntries([sram.mem!]));
     });
 
     test('MRET returns from trap', () async {

@@ -13,11 +13,11 @@ export 'devices/plic.dart';
 export 'devices/sram.dart';
 export 'devices/uart.dart';
 
-const Map<String, DeviceEmulatorFactory> kDeviceEmulatorFactory = {
-  'riscv,clint': RiscVClintEmulator.create,
-  'river,dram': DramEmulator.create,
-  'riscv,plic': RiscVPlicEmulator.create,
-  'river,flash': FlashEmulator.create,
-  'river,sram': SramEmulator.create,
-  'river,uart': UartEmulator.create,
+const Map<String, DeviceFactory> kDeviceFactory = {
+  'riscv,clint0': Clint.create,
+  'river,dram': Dram.create,
+  'riscv,plic0': Plic.create,
+  'river,flash': Flash.create,
+  'river,sram': Sram.create,
+  'ns16550a': Uart.create,
 };

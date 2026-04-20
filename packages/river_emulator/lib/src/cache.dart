@@ -3,42 +3,43 @@ import 'package:river/river.dart';
 typedef CacheFill = Future<List<int>> Function(int addr, int size);
 typedef CacheWriteback = Future<void> Function(int addr, int value, int size);
 
-class CacheLineEmulator {
+class CacheLine {
   final List<int> data;
   int tag;
   int lru;
   bool valid;
+  bool locked;
 
-  CacheLineEmulator({
+  CacheLine({
     required this.data,
     required this.tag,
     this.lru = 0,
     this.valid = true,
+    this.locked = false,
   });
 
   @override
   String toString() =>
-      'CacheLineEmulator(tag: $tag, data: $data, lru: $lru, valid: $bool)';
+      'CacheLine(tag: $tag, lru: $lru, valid: $valid, locked: $locked)';
 }
 
-class CacheEmulator {
-  final Cache config;
+class Cache {
+  final HarborCacheConfig config;
   final CacheFill fill;
   final CacheWriteback writeback;
-  final Map<int, List<CacheLineEmulator>> _lines;
+  final Map<int, List<CacheLine>> _lines;
 
   int get _sets => (config.size ~/ config.lineSize) ~/ config.ways;
 
-  CacheEmulator(Cache config, {required this.fill, required this.writeback})
-    : this.config = config,
-      _lines = Map.fromEntries(
+  Cache(this.config, {required this.fill, required this.writeback})
+    : _lines = Map.fromEntries(
         List.generate(
           (config.size ~/ config.lineSize) ~/ config.ways,
           (i) => MapEntry(
             i,
             List.generate(
               config.ways,
-              (_) => CacheLineEmulator(
+              (_) => CacheLine(
                 tag: 0,
                 data: List.filled(config.lineSize, 0),
                 valid: false,
@@ -48,13 +49,15 @@ class CacheEmulator {
         ),
       );
 
-  int _setIndex(int addr) => (addr ~/ config.lineSize) % _sets;
+  int _unsigned(int addr) => addr & 0xFFFFFFFF;
 
-  int _tag(int addr) => addr ~/ config.lineSize ~/ _sets;
+  int _setIndex(int addr) => (_unsigned(addr) ~/ config.lineSize) % _sets;
 
-  int _offset(int addr) => addr % config.lineSize;
+  int _tag(int addr) => _unsigned(addr) ~/ config.lineSize ~/ _sets;
 
-  CacheLineEmulator? _findLine(int addr) {
+  int _offset(int addr) => _unsigned(addr) % config.lineSize;
+
+  CacheLine? _findLine(int addr) {
     final set = _lines[_setIndex(addr)]!;
     final t = _tag(addr);
 
@@ -67,12 +70,16 @@ class CacheEmulator {
     return null;
   }
 
-  CacheLineEmulator _allocateLine(int addr) {
+  CacheLine _allocateLine(int addr) {
     final set = _lines[_setIndex(addr)]!;
     final t = _tag(addr);
 
-    set.sort((a, b) => a.lru.compareTo(b.lru));
-    final victim = set.last;
+    final candidates = set.where((l) => !l.locked).toList();
+    if (candidates.isEmpty) {
+      throw StateError('All cache lines in set ${_setIndex(addr)} are locked');
+    }
+    candidates.sort((a, b) => a.lru.compareTo(b.lru));
+    final victim = candidates.last;
 
     victim.tag = t;
     victim.valid = true;
@@ -81,7 +88,7 @@ class CacheEmulator {
     return victim;
   }
 
-  void _markUsed(CacheLineEmulator line) {
+  void _markUsed(CacheLine line) {
     final set = _lines.values.firstWhere((s) => s.contains(line));
     for (final l in set) {
       l.lru++;
@@ -92,13 +99,37 @@ class CacheEmulator {
   void reset() {
     for (final set in _lines.values) {
       for (final line in set) {
+        if (!line.locked) {
+          line.valid = false;
+        }
+        line.lru = 0;
+      }
+    }
+  }
+
+  void fullReset() {
+    for (final set in _lines.values) {
+      for (final line in set) {
         line.valid = false;
+        line.locked = false;
         line.lru = 0;
       }
     }
   }
 
   Future<int>? read(int addr, int size) async {
+    // A read straddling a cache-line boundary (e.g. a 4-byte fetch split 2/2
+    // across lines with RVC-aligned code) would index past this line's data.
+    // Split into per-byte reads so each resolves against the correct line.
+    if (_offset(addr) + size > config.lineSize) {
+      int value = 0;
+      for (int i = 0; i < size; i++) {
+        final byte = (await read(addr + i, 1)) ?? 0;
+        value |= (byte & 0xFF) << (8 * i);
+      }
+      return value;
+    }
+
     final line = _findLine(addr);
     if (line != null) {
       _markUsed(line);
@@ -138,7 +169,7 @@ class CacheEmulator {
       return;
     }
 
-    CacheLineEmulator? line = _findLine(addr);
+    CacheLine? line = _findLine(addr);
 
     if (line == null) {
       line = _allocateLine(addr);
@@ -156,18 +187,54 @@ class CacheEmulator {
 
     _markUsed(line);
 
-    await writeback(addr, value, size);
+    if (!line.locked) {
+      await writeback(addr, value, size);
+    }
   }
 
   bool invalidate(int addr) {
     final line = _findLine(addr);
-    if (line != null) {
+    if (line != null && !line.locked) {
       line.valid = false;
       return true;
     }
     return false;
   }
 
+  CacheLine? findLockedLine(int addr) {
+    final line = _findLine(addr);
+    if (line != null && line.locked) return line;
+    return null;
+  }
+
+  void lockRange(int addr, int size) {
+    addr = _unsigned(addr);
+    final end = addr + size;
+    for (var a = addr; a < end; a += config.lineSize) {
+      var line = _findLine(a);
+      if (line == null) {
+        line = _allocateLine(a);
+        line.data.fillRange(0, config.lineSize, 0);
+      }
+      line.locked = true;
+    }
+  }
+
+  void unlockRange(int addr, int size) {
+    for (var a = addr; a < addr + size; a += config.lineSize) {
+      final line = _findLine(a);
+      if (line != null) line.locked = false;
+    }
+  }
+
+  void unlockAll() {
+    for (final set in _lines.values) {
+      for (final line in set) {
+        line.locked = false;
+      }
+    }
+  }
+
   @override
-  String toString() => 'CacheEmulator($config)';
+  String toString() => 'Cache($config)';
 }

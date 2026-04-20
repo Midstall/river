@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:riscv/riscv.dart';
 import 'package:river/river.dart';
 import 'package:river_emulator/river_emulator.dart';
 import 'package:test/test.dart';
@@ -9,44 +8,42 @@ import '../constants.dart';
 
 void main() {
   cpuTests('PLIC Device', (config) {
-    late SramEmulator sram;
-    late RiscVPlicEmulator plic;
-    late RiverCoreEmulator core;
+    late Sram sram;
+    late Plic plic;
+    late RiverCore core;
 
     const plicAddr = 0x40000;
 
     setUp(() {
-      sram = SramEmulator(
-        Device.simple(
+      sram = Sram(
+        RiverDevice(
           name: 'sram',
           compatible: 'river,sram',
           range: BusAddressRange(0, 0xFFFF),
-          fields: const {0: DeviceField('data', 4)},
-          clock: config.clock,
+          clockFrequency: (config.clock.rate as HarborFixedClockRate).frequency,
         ),
       );
 
-      plic = RiscVPlicEmulator(
-        RiscVPlic(
+      plic = Plic(
+        RiverDevice(
           name: 'plic',
-          address: plicAddr,
-          interrupt: 0,
-          clock: config.clock,
+          compatible: 'riscv,plic0',
+          range: BusAddressRange(plicAddr, 0x4000000),
+          interrupts: [0],
+          clockFrequency: (config.clock.rate as HarborFixedClockRate).frequency,
         ),
         numSources: 8,
       );
 
-      core = RiverCoreEmulator(
+      core = RiverCore(
         config,
         memDevices: Map.fromEntries([sram.mem!, plic.mem!]),
       );
     });
 
-    Future<void> writeWord(int addr, int val) =>
-        core.mmu.write(addr, val, MicroOpMemSize.word.bytes);
+    Future<void> writeWord(int addr, int val) => core.mmu.write(addr, val, 4);
 
-    Future<int> readWord(int addr) =>
-        core.mmu.read(addr, MicroOpMemSize.word.bytes);
+    Future<int> readWord(int addr) => core.mmu.read(addr, 4);
 
     test('No interrupt when pending=0', () {
       final irq = plic.interrupts(0)[0];
@@ -59,8 +56,8 @@ void main() {
     });
 
     test('Interrupt fires when pending AND enabled', () async {
-      await writeWord(plicAddr + 0, 1);
-      await writeWord(plicAddr + 0x200, 1 << 1);
+      await writeWord(plicAddr + 0x4, 1);
+      await writeWord(plicAddr + 0x2000, 1 << 1);
       await writeWord(plicAddr + 0x200000, 0);
 
       plic.setSourcePending(1, true);
@@ -69,8 +66,8 @@ void main() {
     });
 
     test('Claim returns correct ID and clears pending', () async {
-      await writeWord(plicAddr + 0, 1);
-      await writeWord(plicAddr + 0x200, 1 << 1);
+      await writeWord(plicAddr + 0x4, 1);
+      await writeWord(plicAddr + 0x2000, 1 << 1);
       await writeWord(plicAddr + 0x200000, 0);
 
       // Assert interrupt
@@ -80,15 +77,15 @@ void main() {
       final id = await readWord(plicAddr + 0x200004);
       expect(id, 1);
 
-      final pending = await readWord(plicAddr + 0x100);
+      final pending = await readWord(plicAddr + 0x1000);
       expect((pending & (1 << 1)) != 0, isFalse);
 
       expect(plic.interrupts(0)[0], isFalse);
     });
 
     test('Threshold blocks lower priority interrupts', () async {
-      await writeWord(plicAddr + 0, 1);
-      await writeWord(plicAddr + 0x200, 1 << 1);
+      await writeWord(plicAddr + 0x4, 1);
+      await writeWord(plicAddr + 0x2000, 1 << 1);
       await writeWord(plicAddr + 0x200000, 2);
 
       plic.setSourcePending(1, true);
@@ -96,11 +93,11 @@ void main() {
     });
 
     test('Higher priority interrupt wins', () async {
-      await writeWord(plicAddr + 0, 1);
+      await writeWord(plicAddr + 0x4, 1);
 
       plic.setPriority(2, 3);
 
-      await writeWord(plicAddr + 0x200, (1 << 1) | (1 << 2));
+      await writeWord(plicAddr + 0x2000, (1 << 1) | (1 << 2));
       await writeWord(plicAddr + 0x200000, 0);
 
       plic.setSourcePending(1, true);

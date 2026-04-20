@@ -4,14 +4,13 @@ import 'package:river/river.dart';
 import '../dev.dart';
 import '../soc.dart';
 
-class UartEmulator extends DeviceEmulator {
+class Uart extends Device {
   final Stream<List<int>> input;
   final StreamSink<List<int>> output;
 
   final List<int> _rxFifo = [];
   final List<int> _txFifo = [];
-
-  late final StreamSubscription _inputSubscription;
+  bool _txPending = false;
 
   int dll = 0;
   int dlm = 0;
@@ -24,8 +23,8 @@ class UartEmulator extends DeviceEmulator {
   int scr = 0;
   int fcr = 0;
 
-  UartEmulator(super.config, {required this.input, required this.output}) {
-    _inputSubscription = input.listen((data) {
+  Uart(super.config, {required this.input, required this.output}) {
+    input.listen((data) {
       _rxFifo.addAll(data);
       _updateLineStatus();
       _updateIIR();
@@ -38,7 +37,7 @@ class UartEmulator extends DeviceEmulator {
 
   int get baud {
     if (divisor == 0) return 0;
-    return config.clock!.baseFreqHz ~/ divisor;
+    return (config.clockFrequency ?? 0) ~/ divisor;
   }
 
   void _updateLineStatus() {
@@ -51,8 +50,10 @@ class UartEmulator extends DeviceEmulator {
   }
 
   Future<void> flush() async {
-    while (_txFifo.isNotEmpty) await Future.delayed(Duration.zero);
-    await Future.delayed(Duration.zero);
+    while (_txFifo.isNotEmpty) {
+      await Future<void>.delayed(Duration.zero);
+    }
+    await Future<void>.delayed(Duration.zero);
   }
 
   void _updateIIR() {
@@ -75,8 +76,6 @@ class UartEmulator extends DeviceEmulator {
   }
 
   bool _lineStatusInterrupt() {
-    // Typically parity/framing/overrun/break errors
-    // For now: no errors
     return false;
   }
 
@@ -100,32 +99,31 @@ class UartEmulator extends DeviceEmulator {
     _txFifo.add(value & 0xFF);
     _updateLineStatus();
     _updateIIR();
-
-    if (_txFifo.isNotEmpty) {
-      _scheduleNextTx();
-    }
+    _scheduleNextTx();
   }
 
   void _scheduleNextTx() {
-    if (_txFifo.isEmpty) return;
-
-    final byte = _txFifo.first;
+    // Only one drain may be in flight; otherwise multiple timers race and
+    // capture a stale head, dropping/duplicating bytes.
+    if (_txPending || _txFifo.isEmpty) return;
+    _txPending = true;
 
     Future.delayed(txDelay(), () {
+      _txPending = false;
+      if (_txFifo.isEmpty) return;
+
+      final byte = _txFifo.removeAt(0);
       output.add([byte]);
-      _txFifo.removeAt(0);
 
       _updateLineStatus();
       _updateIIR();
 
-      if (_txFifo.isNotEmpty) {
-        _scheduleNextTx();
-      }
+      _scheduleNextTx();
     });
   }
 
   @override
-  Map<int, bool> interrupts(int hartId) {
+  Map<int, bool> interrupts(int hart) {
     final pending = (iir & 0x01) == 0;
     return {0: pending};
   }
@@ -148,12 +146,12 @@ class UartEmulator extends DeviceEmulator {
   }
 
   @override
-  DeviceAccessorEmulator? get memAccessor => UartAccessorEmulator(this);
+  DeviceAccessor? get memAccessor => UartAccessor(this);
 
-  static DeviceEmulator create(
-    Device config,
+  static Device create(
+    RiverDevice config,
     Map<String, String> options,
-    RiverSoCEmulator _soc,
+    RiverSoC soc,
   ) {
     Stream<List<int>>? input;
     StreamSink<List<int>>? output;
@@ -188,74 +186,73 @@ class UartEmulator extends DeviceEmulator {
       input = stdin;
     }
 
-    return UartEmulator(config, input: input!, output: output ?? stdout);
+    return Uart(config, input: input, output: output ?? stdout);
   }
 }
 
-class UartAccessorEmulator extends DeviceFieldAccessorEmulator<UartEmulator> {
-  UartAccessorEmulator(super.device);
+class UartAccessor extends DeviceAccessor {
+  final Uart device;
+
+  UartAccessor(this.device) : super(type: DeviceAccessorType.io);
 
   @override
-  Future<int> readPath(String name) async {
-    switch (name) {
-      case 'rbr_thr_dll':
-        await Future.delayed(Duration.zero);
+  Future<int> read(int addr, int width) async {
+    // NS16550A register map (1 byte each)
+    switch (addr) {
+      case 0: // RBR/DLL
+        await Future<void>.delayed(Duration.zero);
         return device.dlab ? device.dll : device._readRBR();
-      case 'ier_dlm':
+      case 1: // IER/DLM
         return device.dlab ? device.dlm : device.ier;
-      case 'iir_fcr':
+      case 2: // IIR
         return device.iir | (device.fcr & 0xC0);
-      case 'lcr':
+      case 3: // LCR
         return device.lcr;
-      case 'mcr':
+      case 4: // MCR
         return device.mcr;
-      case 'lsr':
-        await Future.delayed(Duration.zero);
+      case 5: // LSR
+        await Future<void>.delayed(Duration.zero);
         return device.lsr;
-      case 'msr':
+      case 6: // MSR
         return device.msr;
-      case 'scr':
+      case 7: // SCR
         return device.scr;
+      default:
+        return 0;
     }
-
-    return 0;
   }
 
   @override
-  Future<void> writePath(String name, int value) async {
+  Future<void> write(int addr, int value, int width) async {
     value &= 0xFF;
 
-    switch (name) {
-      case 'rbr_thr_dll':
-        if (device.dlab)
+    switch (addr) {
+      case 0: // THR/DLL
+        if (device.dlab) {
           device.dll = value;
-        else
+        } else {
           device._writeTHR(value);
-        break;
-      case 'ier_dlm':
-        if (device.dlab)
+        }
+      case 1: // IER/DLM
+        if (device.dlab) {
           device.dlm = value;
-        else
+        } else {
           device.ier = value;
+        }
         device._updateIIR();
-        break;
-      case 'iir_fcr':
+      case 2: // FCR
         device.fcr = value;
         if ((value & 0x02) != 0) device._rxFifo.clear();
         if ((value & 0x04) != 0) device._txFifo.clear();
         device._updateLineStatus();
         device._updateIIR();
-        break;
-      case 'lcr':
+      case 3: // LCR
         device.lcr = value;
         device._updateLineStatus();
-        break;
-      case 'mcr':
+      case 4: // MCR
         device.mcr = value;
-        break;
-      case 'scr':
+      case 7: // SCR
         device.scr = value;
-        break;
     }
   }
 }

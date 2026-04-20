@@ -1,719 +1,986 @@
-import 'package:riscv/riscv.dart';
 import 'package:river/river.dart';
 import 'package:rohd/rohd.dart';
-import 'package:rohd_hcl/rohd_hcl.dart';
 
-class MmuModule extends Module {
-  final Mmu config;
+/// River MMU with Wishbone bus master downstream.
+///
+/// Upstream: ifetch (en/addr → done/valid/rdata) and dport (en/addr/we/wdata/size → done/valid/rdata)
+/// Downstream: Wishbone master (CYC/STB/WE/ADR/DAT_MOSI/SEL → ACK/DAT_MISO)
+///
+/// Internally: priority arbiter (dport > ifetch), Wishbone master FSM.
+class RiverMmu extends Module {
+  final HarborMmuConfig mmuConfig;
+  final WishboneConfig busConfig;
 
-  MmuModule(
+  // Upstream response outputs
+  Logic get ifetchDone => output('ifetch_done');
+  Logic get ifetchValid => output('ifetch_valid');
+  Logic get ifetchRdata => output('ifetch_rdata');
+  Logic get dportDone => output('dport_done');
+  Logic get dportValid => output('dport_valid');
+  Logic get dportRdata => output('dport_rdata');
+  Logic get dportFault => output('dport_fault');
+  Logic get dportFaultGuest => output('dport_fault_guest');
+  Logic get ifetchFault => output('ifetch_fault');
+
+  // Downstream bus master outputs
+  Logic get wbCyc => output('dataBus_CYC');
+  Logic get wbStb => output('dataBus_STB');
+  Logic get wbWe => output('dataBus_WE');
+  Logic get wbAdr => output('dataBus_ADR');
+  Logic get wbDatMosi => output('dataBus_DAT_MOSI');
+  Logic get wbSel => output('dataBus_SEL');
+
+  RiverMmu(
     Logic clk,
     Logic reset,
-    List<(MemoryAccess, DataPortInterface)> memWritePorts,
-    List<(MemoryAccess, DataPortInterface)> memReadPorts, {
-    required this.config,
-    Logic? privilegeMode,
-    Logic? enableSum,
-    Logic? enableMxr,
-    Logic? pagingMode,
-    Logic? pageTableAddress,
-    Logic? fence,
-    Map<MemoryBlock, (DataPortInterface?, DataPortInterface?)> devices =
-        const {},
+    Logic ifetchEn,
+    Logic ifetchAddr,
+    Logic dportEn,
+    Logic dportAddr,
+    Logic dportWe,
+    Logic dportWdata,
+    Logic dportSize,
+    Logic wbAck,
+    Logic wbDatMiso, {
+    required this.mmuConfig,
+    required this.busConfig,
+    Logic? satpMode,
+    Logic? satpRoot,
+    // Hypervisor two-stage: when [virtIn]=1 and [gMode]!=0, the (VS-stage)
+    // page-table walk addresses, every PTE pointer and the final leaf, are
+    // themselves G-translated through the hgatp table ([gMode]/[gRoot]) before
+    // the host bus access. satpMode/satpRoot already carry vsatp when virt=1.
+    Logic? virtIn,
+    Logic? gMode,
+    Logic? gRoot,
+    Logic? privMode, // current effective privilege (for U-bit/SUM checks)
+    Logic? sum, // mstatus.SUM (supervisor may access user pages)
+    Logic? mxr, // mstatus.MXR (loads may read execute-only pages)
+    // When true, instruction fetches below machine mode are translated through
+    // the page table (X-permission + U-bit fetch rule, faulting to ifetch_fault).
+    // Defaults off until the fetch consumer wires ifetch_fault to cause 12.
+    bool translateFetch = false,
+    // Pulsed when the core executes sfence.vma (or fence.i, which over-flushes
+    // harmlessly): invalidates the single-entry fetch TLB so a page-table edit
+    // that does not change satp is observed by the next fetch.
+    Logic? tlbFlush,
+    // DTLBFC (rpipelinectl[3]): when high, also flush the data TLB on every
+    // privilege-mode change (satp changes already flush). Closes the data-TLB
+    // residue channel across context switches for paranoid configs.
+    Logic? dtlbFlushOnPrivChange,
     super.name = 'river_mmu',
   }) {
+    final xlen = mmuConfig.mxlen.size;
+
     clk = addInput('clk', clk);
     reset = addInput('reset', reset);
-
-    memWritePorts = memWritePorts.indexed
-        .map(
-          (e) => (
-            e.$2.$1,
-            e.$2.$2.clone()..connectIO(
-              this,
-              e.$2.$2,
-              outputTags: {DataPortGroup.integrity},
-              inputTags: {DataPortGroup.control, DataPortGroup.data},
-              uniquify: (og) => 'memWrite${e.$1}_$og',
-            ),
-          ),
-        )
-        .toList();
-
-    memReadPorts = memReadPorts.indexed
-        .map(
-          (e) => (
-            e.$2.$1,
-            e.$2.$2.clone()..connectIO(
-              this,
-              e.$2.$2,
-              outputTags: {DataPortGroup.data, DataPortGroup.integrity},
-              inputTags: {DataPortGroup.control},
-              uniquify: (og) => 'memRead${e.$1}_$og',
-            ),
-          ),
-        )
-        .toList();
-
-    devices = Map.fromEntries(
-      devices.entries.indexed.map((e) {
-        final index = e.$1;
-        final mmap = e.$2.key;
-        final devReadPort = e.$2.value.$1;
-        final devWritePort = e.$2.value.$2;
-        return MapEntry(mmap, (
-          devReadPort != null
-              ? (devReadPort!.clone()..connectIO(
-                  this,
-                  devReadPort!,
-                  outputTags: {DataPortGroup.control},
-                  inputTags: {DataPortGroup.data, DataPortGroup.integrity},
-                  uniquify: (og) => 'devRead${index}_$og',
-                ))
-              : null,
-          devWritePort != null
-              ? (devWritePort!.clone()..connectIO(
-                  this,
-                  devWritePort!,
-                  outputTags: {DataPortGroup.control, DataPortGroup.data},
-                  inputTags: {DataPortGroup.integrity},
-                  uniquify: (og) => 'devWrite${index}_$og',
-                ))
-              : null,
-        ));
-      }),
+    ifetchEn = addInput('ifetch_en', ifetchEn);
+    ifetchAddr = addInput('ifetch_addr', ifetchAddr, width: xlen);
+    dportEn = addInput('dport_en', dportEn);
+    dportAddr = addInput('dport_addr', dportAddr, width: xlen);
+    dportWe = addInput('dport_we', dportWe);
+    dportWdata = addInput('dport_wdata', dportWdata, width: xlen);
+    dportSize = addInput('dport_size', dportSize, width: 3);
+    wbAck = addInput('dataBus_ACK', wbAck);
+    wbDatMiso = addInput(
+      'dataBus_DAT_MISO',
+      wbDatMiso,
+      width: busConfig.dataWidth,
     );
 
-    if (privilegeMode != null)
-      privilegeMode = addInput('privilegeMode', privilegeMode!, width: 3);
+    // satp.MODE (0=bare, 8=Sv39, 9=Sv48) and root PPN. When wired and MODE!=0,
+    // data accesses are translated by walking the page table over the bus.
+    final hasPaging = satpMode != null && satpRoot != null;
+    satpMode = hasPaging ? addInput('satp_mode', satpMode, width: 4) : null;
+    satpRoot = hasPaging ? addInput('satp_root', satpRoot, width: xlen) : null;
 
-    if (fence != null) fence = addInput('fence', fence!);
+    // Two-stage (hypervisor G-stage) wiring is present only when all three are
+    // provided AND single-stage paging exists to build on.
+    final hasTwoStage =
+        hasPaging && virtIn != null && gMode != null && gRoot != null;
+    virtIn = hasTwoStage ? addInput('virt', virtIn) : null;
+    gMode = hasTwoStage ? addInput('g_mode', gMode, width: 4) : null;
+    gRoot = hasTwoStage ? addInput('g_root', gRoot, width: xlen) : null;
 
-    if (config.hasSum) {
-      assert(enableSum != null, 'SUM is enabled in the MMU but not wired up.');
-      enableSum = addInput('enableSum', enableSum!);
+    // Privilege/permission inputs for leaf checks (U-bit, SUM, MXR). When not
+    // wired, the leaf check falls back to R/W only (the pre-existing behavior).
+    final priv = privMode == null ? null : addInput('priv', privMode, width: 3);
+    final sumIn = sum == null ? null : addInput('sum', sum);
+    final mxrIn = mxr == null ? null : addInput('mxr', mxr);
+    final tlbFlushIn = tlbFlush == null
+        ? Const(0)
+        : addInput('tlbFlush', tlbFlush);
+    final dtlbFlushOnPrivIn = dtlbFlushOnPrivChange == null
+        ? Const(0)
+        : addInput('dtlbFlushOnPriv', dtlbFlushOnPrivChange);
+
+    addOutput('ifetch_done');
+    addOutput('ifetch_valid');
+    addOutput('ifetch_rdata', width: xlen);
+    addOutput('dport_done');
+    addOutput('dport_valid');
+    addOutput('dport_rdata', width: xlen);
+    addOutput('dport_fault');
+    // 1 when the dport fault occurred in the G-stage (second-stage) walk, so the
+    // consumer can raise a *guest* page-fault cause (20/21/23) vs the regular
+    // VS-stage cause (12/13/15).
+    addOutput('dport_fault_guest');
+    // Asserted with ifetch_done & ~ifetch_valid when an instruction-fetch walk
+    // faults (invalid PTE, no X permission, or a U-bit violation). Lets the
+    // fetch consumer raise an instruction page fault (cause 12).
+    addOutput('ifetch_fault');
+    addOutput('dataBus_CYC');
+    addOutput('dataBus_STB');
+    addOutput('dataBus_WE');
+    addOutput('dataBus_ADR', width: busConfig.addressWidth);
+    addOutput('dataBus_DAT_MOSI', width: busConfig.dataWidth);
+    addOutput('dataBus_SEL', width: busConfig.effectiveSelWidth);
+
+    // Internal registers
+    final arbState = Logic(name: 'arbState', width: 2);
+    final busActive = Logic(name: 'busActive');
+    // Set for one cycle after a transaction completes so arbitration pauses,
+    // letting the requester (e.g. the fetch unit redirecting to a straddle's
+    // second word) present its next address before the next grant. Without it
+    // the arbiter would re-grant the stale address the moment the bus frees.
+    final justCompleted = Logic(name: 'justCompleted');
+
+    final ifDoneR = Logic(name: 'ifDoneR');
+    final ifValidR = Logic(name: 'ifValidR');
+    final ifRdataR = Logic(name: 'ifRdataR', width: xlen);
+    final dpDoneR = Logic(name: 'dpDoneR');
+    final dpValidR = Logic(name: 'dpValidR');
+    final dpRdataR = Logic(name: 'dpRdataR', width: xlen);
+    // Asserted with dpDone & ~dpValid when a page-table walk faults (invalid PTE
+    // or leaf-permission violation). Lets the dport consumer raise a *page*
+    // fault rather than the generic access fault.
+    final dpFaultR = Logic(name: 'dpFaultR');
+    final dpFaultGuestR = Logic(name: 'dpFaultGuestR');
+    // Asserted when a walk faults for an instruction fetch (routes the fault to
+    // ifetch_fault instead of dport_fault).
+    final ifFaultR = Logic(name: 'ifFaultR');
+    final cycR = Logic(name: 'cycR');
+    final stbR = Logic(name: 'stbR');
+    final weR = Logic(name: 'weR');
+    final adrR = Logic(name: 'adrR', width: busConfig.addressWidth);
+    final datMosiR = Logic(name: 'datMosiR', width: busConfig.dataWidth);
+    final selR = Logic(name: 'selR', width: busConfig.effectiveSelWidth);
+
+    final selW = busConfig.effectiveSelWidth;
+
+    // Page-table-walk state (only used when hasPaging). `walking` = the bus is
+    // fetching PTEs (vs the final translated access); walkLevel counts down from
+    // levels-1; the original dport request is held in req*.
+    final walking = Logic(name: 'walking');
+    final walkLevel = Logic(name: 'walkLevel', width: 3);
+    final reqAddr = Logic(name: 'reqAddr', width: xlen);
+    final reqWe = Logic(name: 'reqWe');
+    final reqWdata = Logic(name: 'reqWdata', width: xlen);
+    final reqSize = Logic(name: 'reqSize', width: 3);
+    // Each bus access of the walk is its own Wishbone transaction (cyc/stb drop
+    // between accesses, mirroring the single-access path). walkArmed = an access
+    // address is queued; walkAddr = that address; armed accesses are launched by
+    // a dedicated branch once the bus has gone idle.
+    final walkArmed = Logic(name: 'walkArmed');
+    final walkAddr = Logic(name: 'walkAddr', width: busConfig.addressWidth);
+    // 1 while the active walk is for an instruction fetch (access type = instr),
+    // so leaf-permission checks use the X bit and the fetch U-bit rule, and a
+    // fault/result routes to the ifetch ports rather than the dport ports.
+    final isFetchWalk = Logic(name: 'isFetchWalk');
+    // Svadu hardware A/D update: after a leaf read whose A (or, for a write, D)
+    // bit needs setting, the walk writes the updated PTE back to memory (an extra
+    // bus transaction) before the translated access. `adWrite` is 1 while that
+    // writeback is in flight; `adTransPa` stashes the translated PA to resume.
+    final adWrite = Logic(name: 'adWrite');
+    final adTransPa = Logic(name: 'adTransPa', width: busConfig.addressWidth);
+
+    // Single-entry instruction-fetch TLB. Caches the last walked fetch
+    // translation so the lockstep front-end (which re-presents the same
+    // instruction each cycle) does not re-walk per fetch and starve the data
+    // port. `ftlbPte` holds the leaf so the permission check re-runs per access
+    // (priv may change). Invalidated on satp change.
+    final ftlbValid = Logic(name: 'ftlbValid');
+    final ftlbVpn = Logic(name: 'ftlbVpn', width: xlen - 12);
+    final ftlbPte = Logic(name: 'ftlbPte', width: xlen);
+    // Single-entry data TLB (mirrors the fetch TLB). `dtlbPte` holds the leaf so
+    // R/W/U re-checks per access. Single-stage only: guest (two-stage) accesses
+    // always walk (the cached leaf would be guest-physical). Flushed with ftlb.
+    final dtlbValid = Logic(name: 'dtlbValid');
+    final dtlbVpn = Logic(name: 'dtlbVpn', width: xlen - 12);
+    final dtlbPte = Logic(name: 'dtlbPte', width: xlen);
+    final satpShadowMode = Logic(name: 'satpShadowMode', width: 4);
+    final satpShadowRoot = Logic(name: 'satpShadowRoot', width: xlen);
+    // Shadow of the privilege mode, to detect a context switch for DTLBFC.
+    final privShadow = Logic(name: 'privShadow', width: 3);
+    final privChanged = priv == null
+        ? Const(0)
+        : priv.neq(privShadow).named('privChanged');
+
+    // G-stage (hypervisor second-stage) walk state. Under two-stage, every
+    // VS-stage bus address (`walkAddr`) is guest-physical and must be G-walked
+    // through hgatp before launch. `gTranslated` marks `walkAddr` as already
+    // host-physical (launch directly). `gWalking`/`gWalkLevel`/`gWalkArmed`/
+    // `gWalkAddr` mirror the VS-walk state for the inner G walk; `gReqAddr` holds
+    // the guest-physical being translated; `gSave*` preserve the VS access's
+    // we/data/sel across the G sub-walk so the final store re-launches.
+    final gWalking = Logic(name: 'gWalking');
+    final gWalkLevel = Logic(name: 'gWalkLevel', width: 3);
+    final gWalkArmed = Logic(name: 'gWalkArmed');
+    final gWalkAddr = Logic(name: 'gWalkAddr', width: busConfig.addressWidth);
+    final gReqAddr = Logic(name: 'gReqAddr', width: xlen);
+    final gTranslated = Logic(name: 'gTranslated');
+    final gSaveWe = Logic(name: 'gSaveWe');
+    final gSaveData = Logic(name: 'gSaveData', width: xlen);
+    final gSaveSel = Logic(name: 'gSaveSel', width: selW);
+
+    // VPN[level] (9 bits): bits [12 + 9*level +: 9]. Each level's field is a
+    // fixed slice (L0=[20:12], L1=[29:21], L2=[38:30], L3=[47:39]), so select
+    // with a small 4:1 mux instead of a 64-bit variable barrel shift (big LUT
+    // saving).
+    Logic vpnOf(Logic addr, Logic level) {
+      Logic field(int lvl) => addr.slice(12 + 9 * lvl + 8, 12 + 9 * lvl);
+      return mux(
+        level.eq(0),
+        field(0),
+        mux(level.eq(1), field(1), mux(level.eq(2), field(2), field(3))),
+      );
     }
 
-    if (config.hasMxr) {
-      assert(enableMxr != null, 'MXR is enabled in the MMU but not wired up.');
-      enableMxr = addInput('enableMxr', enableMxr!);
+    // PTE fields (Sv39/Sv48, 8-byte PTE in the low bus word): V=bit0, R=bit1,
+    // X=bit3, PPN=bits 53:10. Next page-table base = PPN<<12.
+    Logic pteLeaf(Logic pte) => pte[1] | pte[3];
+    // Page-fault conditions (V=bit0, R=bit1, W=bit2). A PTE is invalid if V=0
+    // or the reserved encoding W&&!R. At a leaf, the access is denied if a write
+    // (reqWe) hits a non-writable page or a read hits a non-readable one.
+    Logic pteInvalid(Logic pte) => ~pte[0] | (~pte[1] & pte[2]);
+    // Leaf permission fault: the requested access must be allowed by the PTE.
+    // A fetch (isFetch) needs the X bit; a write needs W; a read needs R, or X
+    // when MXR lets a load read an execute-only page. The U bit must also fit the
+    // privilege: a user access needs U=1, and a supervisor access to a user page
+    // needs SUM, except a supervisor FETCH from a user page is never allowed
+    // (SUM does not cover instruction fetch). M-mode and unwired priv fall back
+    // to the R/W/X check only.
+    Logic leafPermFault(Logic pte, Logic isFetch, Logic we) {
+      final dataPerm = mux(
+        we,
+        pte[2], // write -> W
+        pte[1] | ((mxrIn ?? Const(0)) & pte[3]), // read -> R | (MXR & X)
+      );
+      final permOk = mux(isFetch, pte[3], dataPerm); // fetch -> X
+      if (priv == null) return ~permOk;
+      final isUser = priv.eq(Const(PrivilegeMode.user.id, width: 3));
+      final isSup = priv.eq(Const(PrivilegeMode.supervisor.id, width: 3));
+      final u = pte[4];
+      // SUM only relaxes supervisor data access to user pages, not fetches.
+      final supUserOk = (sumIn ?? Const(0)) & ~isFetch;
+      final uFault = (isUser & ~u) | (isSup & u & ~supUserOk);
+      return ~permOk | uFault;
     }
 
-    List<Conditional> pagingReset = [];
-    List<Conditional> pagingCycle = [];
-
-    final devReadBusy = Logic(name: 'devReadBusy');
-    final devReadClaim = Logic(
-      name: 'devReadClaim',
-      width: (devices.length + 1).bitLength,
-    );
-    final devReadDone = Logic(name: 'devReadDone');
-    final devReadValid = Logic(name: 'devReadValid');
-    final devReadEnable = Logic(name: 'devReadEnable');
-    final devReadAddr = Logic(name: 'devReadAddr', width: config.mxlen.size);
-    final devReadData = Logic(name: 'devReadData', width: config.mxlen.size);
-
-    final devWriteBusy = Logic(name: 'devWriteBusy');
-    final devWriteClaim = Logic(
-      name: 'devWriteClaim',
-      width: (devices.length + 1).bitLength,
-    );
-    final devWriteDone = Logic(name: 'devWriteDone');
-    final devWriteValid = Logic(name: 'devWriteValid');
-    final devWriteEnable = Logic(name: 'devWriteEnable');
-    final devWriteAddr = Logic(name: 'devWriteAddr', width: config.mxlen.size);
-    final devWriteData = Logic(name: 'devWriteData', width: config.mxlen.size);
-
-    final ptwEnable = Logic(name: 'ptwEnable');
-    final ptwDone = Logic(name: 'ptwDone');
-    final ptwValid = Logic(name: 'ptwValid');
-    final ptwAccess = Logic(name: 'ptwAccess', width: 3);
-    final ptwPaddr = Logic(name: 'ptwPaddr', width: config.mxlen.size);
-    final ptwVaddr = Logic(name: 'ptwVaddr', width: config.mxlen.size);
-
-    Logic needsPageTranslation = Const(0);
-
-    if (config.hasPaging) {
-      final pagingModes = PagingMode.values.where(
-        (m) => m.isSupported(config.mxlen),
-      );
-
-      final maxPagingLevel = pagingModes
-          .map((m) => m.levels)
-          .fold(0, (a, b) => a > b ? a : b);
-
-      final maxModeId = pagingModes
-          .map((m) => m.id)
-          .fold<int>(0, (a, b) => a > b ? a : b);
-      final pagingModeWidth = maxModeId.bitLength == 0
-          ? 1
-          : maxModeId.bitLength;
-
-      assert(
-        pagingMode != null,
-        'Paging is enabled but missing paging mode input',
-      );
-      pagingMode = addInput('pagingMode', pagingMode!, width: pagingModeWidth);
-
-      assert(
-        pageTableAddress != null,
-        'Paging is enabled but missing page table address input',
-      );
-      pageTableAddress = addInput(
-        'pageTableAddress',
-        pageTableAddress!,
-        width: config.mxlen.size,
-      );
-
-      needsPageTranslation = pagingMode!
-          .gt(Const(PagingMode.bare.id, width: pagingMode!.width))
-          .named('needsPageTranslation');
-
-      final ptwCycle = Logic(name: 'ptwCycle', width: maxPagingLevel.bitLength);
-      final pteAddress = Logic(name: 'pteAddress', width: config.mxlen.size);
-      final pte = Logic(name: 'pte', width: config.mxlen.size);
-      final pteV = Logic(name: 'pteV');
-      final pteR = Logic(name: 'pteR');
-      final pteW = Logic(name: 'pteW');
-      final pteX = Logic(name: 'pteX');
-      final pteU = Logic(name: 'pteU');
-
-      List<Logic> defineVPN(Logic addr) {
-        final modes = pagingModes.toList();
-
-        final maxVpnBits = modes
-            .map((m) => m.vpnBits)
-            .fold<int>(0, (a, b) => a > b ? a : b);
-
-        Logic vpnForModeAtLevel(PagingMode m, int level) {
-          if (level >= m.levels || m.levels == 0) {
-            return Const(0, width: maxVpnBits);
-          }
-
-          final shift = 12 + (m.vpnBits * level);
-          final shifted = addr >> Const(shift, width: addr.width);
-
-          final mask = (1 << m.vpnBits) - 1;
-          final masked = shifted & Const(mask, width: addr.width);
-
-          final bits = masked.getRange(0, m.vpnBits - 1);
-
-          return (m.vpnBits == maxVpnBits) ? bits : bits.zeroExtend(maxVpnBits);
-        }
-
-        return List<Logic>.generate(maxPagingLevel, (i) {
-          Logic acc = Const(0, width: maxVpnBits);
-
-          for (final m in modes.reversed) {
-            final isMode = pagingMode!.eq(
-              Const(m.id, width: pagingMode!.width),
-            );
-            final v = vpnForModeAtLevel(m, i);
-            acc = mux(isMode, v.zeroExtend(acc.width), acc);
-          }
-
-          return acc;
-        }).reversed.toList();
-      }
-
-      final pteBytes = pagingModes
-          .fold<Logic>(Const(8, width: config.mxlen.size), (acc, m) {
-            final isMode = pagingMode!.eq(
-              Const(m.id, width: pagingMode!.width),
-            );
-
-            final bytes = Const(m.pteBytes, width: config.mxlen.size);
-
-            return mux(isMode, bytes, acc);
-          })
-          .named('pteBytes');
-
-      List<Logic> vpnTop = defineVPN(ptwVaddr);
-      final vpnBottom = vpnTop.reversed.toList();
-
-      pagingReset.addAll([
-        ptwEnable < 0,
-        ptwDone < 0,
-        ptwValid < 0,
-        ptwAccess < 0,
-        ptwPaddr < 0,
-        ptwVaddr < 0,
-        ptwCycle < 0,
-        pteAddress < 0,
-        pte < 0,
-      ]);
-
-      Logic buildPhys(PagingMode mode, Logic pte) {
-        final offset = ptwVaddr & Const(0xFFF, width: config.mxlen.size);
-        Logic phys = Const(0, width: config.mxlen.size);
-
-        for (int i = 0; i < mode.ppnBits.length; i++) {
-          final fromVpn = ptwCycle.lt(mode.levels - 1 - i);
-          final value = mux(
-            fromVpn,
-            vpnBottom[i].zeroExtend(config.mxlen.size),
-            ((pte >> mode.ppnShift(i)) &
-                    Const((1 << mode.ppnBits[i]) - 1, width: config.mxlen.size))
-                .zeroExtend(config.mxlen.size),
-          );
-
-          phys |= value << mode.ppnPhysShift(i);
-        }
-
-        return phys | offset;
-      }
-
-      pagingCycle.addAll([
-        If(
-          ptwEnable,
-          then: [
-            Case(
-              ptwCycle,
-              [
-                for (var i = 0; i < maxPagingLevel; i++)
-                  CaseItem(Const(i, width: maxPagingLevel.bitLength), [
-                    If(
-                      ~devReadBusy & devReadClaim.eq(0),
-                      then: [
-                        if (i == 0) pteAddress < pageTableAddress,
-                        devReadClaim < 1,
-                        devReadBusy < 1,
-                        devReadEnable < 1,
-                        devReadAddr <
-                            (pteAddress +
-                                vpnTop[i].zeroExtend(config.mxlen.size) *
-                                    pteBytes),
-                      ],
-                    ),
-                    If(
-                      devReadBusy &
-                          devReadClaim.eq(1) &
-                          devReadDone &
-                          devReadValid,
-                      then: [
-                        devReadBusy < 0,
-                        devReadClaim < 0,
-                        devReadEnable < 0,
-                        pte < devReadData,
-                        pteV <
-                            (devReadData &
-                                Const(1, width: config.mxlen.size))[0],
-                        pteR <
-                            ((devReadData >> 1) &
-                                Const(1, width: config.mxlen.size))[0],
-                        pteW <
-                            ((devReadData >> 2) &
-                                Const(1, width: config.mxlen.size))[0],
-                        pteX <
-                            ((devReadData >> 3) &
-                                Const(1, width: config.mxlen.size))[0],
-                        pteU <
-                            ((devReadData >> 4) &
-                                Const(1, width: config.mxlen.size))[0],
-                        If(
-                          (pteV.eq(0) | (pteR.eq(0) & pteW.eq(1))) |
-                              (privilegeMode != null
-                                  ? (privilegeMode!.eq(
-                                          Const(
-                                            PrivilegeMode.user.id,
-                                            width: 3,
-                                          ),
-                                        ) &
-                                        pteU.eq(0))
-                                  : Const(0)) |
-                              (privilegeMode != null
-                                  ? (privilegeMode!.eq(
-                                          Const(
-                                            PrivilegeMode.supervisor.id,
-                                            width: 3,
-                                          ),
-                                        ) &
-                                        pteU.eq(1) &
-                                        (config.hasSum
-                                            ? ~enableSum! & ~ptwAccess.eq(2)
-                                            : Const(0)))
-                                  : Const(0)),
-                          then: [ptwDone < 1, ptwValid < 0],
-                          orElse: [
-                            If(
-                              pteR.eq(1) | pteX.eq(1),
-                              then: [
-                                If(
-                                  ~mux(
-                                    ptwAccess.eq(0),
-                                    pteR.eq(1) |
-                                        (config.hasMxr
-                                            ? enableMxr! & pteX.eq(1)
-                                            : Const(0)),
-                                    mux(
-                                      ptwAccess.eq(1),
-                                      pteW.eq(1),
-                                      mux(
-                                        ptwAccess.eq(2),
-                                        pteX.eq(1),
-                                        Const(0),
-                                      ),
-                                    ),
-                                  ),
-                                  then: [
-                                    ptwDone < 1,
-                                    ptwValid < 0,
-                                    ptwPaddr < 0,
-                                    ptwCycle < 0,
-                                    pteAddress < 0,
-                                  ],
-                                  orElse: [
-                                    Case(
-                                      pagingMode,
-                                      [
-                                        for (final mode in pagingModes)
-                                          CaseItem(
-                                            Const(
-                                              mode.id,
-                                              width: pagingModeWidth,
-                                            ),
-                                            [
-                                              ptwPaddr <
-                                                  buildPhys(mode, devReadData),
-                                              ptwDone < 1,
-                                              ptwValid < 1,
-                                            ],
-                                          ),
-                                      ],
-                                      defaultItem: [ptwDone < 1, ptwValid < 0],
-                                    ),
-                                  ],
-                                ),
-                              ],
-                              orElse: [
-                                pteAddress <
-                                    ((devReadData >> 10) &
-                                            Const(
-                                              (1 << config.mxlen.size) - 1,
-                                              width: config.mxlen.size,
-                                            )) <<
-                                        12,
-                                Case(
-                                  pagingMode,
-                                  [
-                                    for (final mode in pagingModes)
-                                      CaseItem(
-                                        Const(mode.id, width: pagingModeWidth),
-                                        [
-                                          if (i < (mode.levels - 1)) ...[
-                                            ptwCycle < (ptwCycle + 1),
-                                            ptwDone < 0,
-                                            ptwValid < 0,
-                                          ] else ...[
-                                            ptwDone < 1,
-                                            ptwValid < 0,
-                                            ptwPaddr < 0,
-                                            ptwCycle < 0,
-                                            pteAddress < 0,
-                                          ],
-                                        ],
-                                      ),
-                                  ],
-                                  defaultItem: [
-                                    ptwDone < 1,
-                                    ptwValid < 0,
-                                    ptwPaddr < 0,
-                                    ptwCycle < 0,
-                                    pteAddress < 0,
-                                  ],
-                                ),
-                              ],
-                            ),
-                          ],
-                        ),
-                      ],
-                    ),
-                  ]),
-              ],
-              defaultItem: [
-                ptwDone < 1,
-                ptwValid < 0,
-                ptwPaddr < 0,
-                ptwCycle < 0,
-                pteAddress < 0,
-              ],
-            ),
-          ],
-          orElse: [
-            ptwDone < 0,
-            ptwValid < 0,
-            ptwPaddr < 0,
-            ptwCycle < 0,
-            pteAddress < 0,
-            pte < 0,
-          ],
-        ),
-      ]);
-    }
-
-    List<Iff> defineReadPort(
-      MemoryAccess access,
-      DataPortInterface readPort,
-      int id,
-    ) => [
-      if (config.hasPaging)
-        Iff(
-          readPort.en &
-              ~devReadBusy &
-              devReadClaim.eq(0) &
-              needsPageTranslation,
-          [
-            ptwEnable < 1,
-            ptwVaddr < readPort.addr,
-            ptwAccess <
-                switch (access) {
-                  MemoryAccess.instr => 2,
-                  MemoryAccess.write => 1,
-                  MemoryAccess.read => 0,
-                },
-            readPort.done < 0,
-            readPort.valid < 0,
-            readPort.data < 0,
-            If(
-              ptwDone & ptwValid,
-              then: [
-                ptwEnable < 0,
-                devReadBusy < 1,
-                devReadEnable < 1,
-                devReadClaim < id,
-                devReadAddr < ptwPaddr,
-              ],
-            ),
-            If(
-              ptwDone & ~ptwValid,
-              then: [ptwEnable < 0, readPort.done < 1, readPort.valid < 0],
-            ),
-          ],
-        ),
-      Iff(
-        readPort.en & ~devReadBusy & devReadClaim.eq(0) & ~needsPageTranslation,
-        [
-          devReadEnable < 1,
-          devReadBusy < 1,
-          devReadClaim < id,
-          devReadAddr < readPort.addr,
-          readPort.done < 0,
-          readPort.valid < 0,
-          readPort.data < 0,
-        ],
+    Logic pteNextBase(Logic pte) => (pte.slice(53, 10) << 12).zeroExtend(xlen);
+    // Translated physical address for a 4KB leaf: {PTE.PPN, vaddr[11:0]}.
+    Logic leafPa(Logic pte, Logic vaddr) =>
+        [pte.slice(53, 10), vaddr.slice(11, 0)].swizzle().zeroExtend(xlen);
+    // First-level (root) PTE byte address.
+    Logic ptePtr(Logic base, Logic vpn) => base + (vpn.zeroExtend(xlen) << 3);
+    final fullSel = Const((1 << selW) - 1, width: selW);
+    // Byte-enable mask for a log2-sized access, unshifted (lane 0); the lane
+    // shift happens at the bus boundary. Mask covers (1 << size) bytes:
+    // byte=0b1, half=0b11, word=0b1111.
+    Logic sizeSel(Logic log2Size) => mux(
+      log2Size.eq(0),
+      Const(0x1, width: selW),
+      mux(
+        log2Size.eq(1),
+        Const(0x3, width: selW),
+        mux(log2Size.eq(2), Const(0xF, width: selW), fullSel),
       ),
-      Iff(readPort.en & devReadBusy & devReadClaim.eq(id) & devReadDone, [
-        readPort.done < devReadDone,
-        readPort.valid < devReadValid,
-        readPort.data < devReadData,
-      ]),
-      Iff(devReadBusy & devReadClaim.eq(id) & (~readPort.en | devReadDone), [
-        readPort.done < 0,
-        readPort.valid < 0,
-        readPort.data < 0,
-        devReadBusy < 0,
-        devReadClaim < 0,
-        devReadEnable < 0,
-      ]),
-      ElseIf(devReadBusy & devReadClaim.eq(id), [
-        readPort.done < 0,
-        readPort.valid < 0,
-        readPort.data < 0,
-      ]),
-    ];
+    );
+    // Levels-1 start index: Sv48 (MODE 9) = 3, else (Sv39) = 2. When the MMU has
+    // no Sv48, satp.MODE can never be 9, so pin startLevel to 2 and drop the
+    // satpMode==9 compare + Sv48 level (shrinks Sv39-only cores).
+    final hasSv48 = mmuConfig.pagingModes.contains(RiscVPagingMode.sv48);
+    final startLevel = (hasPaging && hasSv48)
+        ? mux(satpMode!.eq(9), Const(3, width: 3), Const(2, width: 3))
+        : Const(2, width: 3);
+    final rootBase = hasPaging
+        ? (satpRoot! << 12).zeroExtend(xlen)
+        : Const(0, width: xlen);
+    final pagingOn = hasPaging ? satpMode!.neq(0) : Const(0);
+    // Fetch is translated only when paging is on AND below machine mode (MPRV
+    // only affects loads/stores, never fetch). When priv is unwired, fall back
+    // to pagingOn. Also bypassed in virtualized mode: a guest fetch needs
+    // two-stage (VS + G) translation, which the fetch path does not do yet.
+    final fetchPagingOn = priv == null
+        ? pagingOn
+        : (pagingOn &
+              priv.neq(Const(PrivilegeMode.machine.id, width: 3)) &
+              (virtIn == null ? Const(1) : ~virtIn));
 
-    List<Iff> defineWritePort(
-      MemoryAccess access,
-      DataPortInterface writePort,
-      int id,
-    ) => [
-      if (config.hasPaging)
-        Iff(
-          writePort.en &
-              ~devWriteBusy &
-              devWriteClaim.eq(0) &
-              needsPageTranslation,
-          [
-            ptwEnable < 1,
-            ptwAccess <
-                switch (access) {
-                  MemoryAccess.instr => 2,
-                  MemoryAccess.write => 1,
-                  MemoryAccess.read => 0,
-                },
-            ptwVaddr < writePort.addr,
-            If(
-              ptwDone & ptwValid,
-              then: [
-                ptwEnable < 0,
-                devWriteEnable < 1,
-                devWriteBusy < 1,
-                devWriteClaim < id,
-                devWriteAddr < ptwPaddr,
-              ],
-            ),
-            If(
-              ptwDone & ~ptwValid,
-              then: [ptwEnable < 0, writePort.done < 1, writePort.valid < 0],
-            ),
-          ],
-        ),
-      Iff(
-        writePort.en &
-            ~devWriteBusy &
-            devWriteClaim.eq(0) &
-            ~needsPageTranslation,
-        [
-          devWriteEnable < 1,
-          devWriteBusy < 1,
-          devWriteClaim < id,
-          devWriteAddr < writePort.addr,
-          devWriteData < writePort.data,
-        ],
-      ),
-      Iff(devWriteBusy & devWriteClaim.eq(id), [
-        writePort.done < devWriteDone,
-        writePort.valid < devWriteValid,
-        If(
-          devWriteDone & ~writePort.en,
-          then: [devWriteBusy < 0, devWriteClaim < 0, devWriteEnable < 0],
-        ),
-      ]),
-    ];
+    // Fetch-TLB lookup for the requested fetch address.
+    final satpChanged = hasPaging
+        ? (satpMode!.neq(satpShadowMode) | satpRoot!.neq(satpShadowRoot))
+        : Const(0);
+    // Gated on hasPaging: leafPa/leafPermFault assume an Sv39/Sv48 (64-bit) PTE
+    // layout, so they must not elaborate for non-paging (e.g. RV32) configs.
+    final ftlbHit = hasPaging
+        ? (ftlbValid &
+              ~satpChanged &
+              ifetchAddr.slice(xlen - 1, 12).eq(ftlbVpn))
+        : Const(0);
+    // Re-run the fetch permission check on the cached leaf (priv may have moved)
+    // and compute the translated physical address from the cached PTE.
+    final ftlbPermFault = hasPaging
+        ? leafPermFault(ftlbPte, Const(1), Const(0))
+        : Const(0);
+    final ftlbPa = hasPaging
+        ? leafPa(ftlbPte, ifetchAddr)
+        : Const(0, width: xlen);
+
+    // G-stage derived signals. twoStage = guest mode with a non-bare G-stage.
+    // gRootBase/gStartLevel = hgatp root and top level. NOTE: the Sv39x4 "+2
+    // bits at the root index" widening is not applied yet, fine while
+    // guest-physical addresses stay in the low 2^(9*levels+12) range.
+    final twoStage = hasTwoStage ? (virtIn! & gMode!.neq(0)) : Const(0);
+    final gRootBase = hasTwoStage
+        ? (gRoot! << 12).zeroExtend(xlen)
+        : Const(0, width: xlen);
+    final gStartLevel = hasTwoStage
+        ? mux(gMode!.eq(9), Const(3, width: 3), Const(2, width: 3))
+        : Const(2, width: 3);
+
+    // Data-TLB lookup for the requested data address. Disabled under two-stage
+    // (guest) translation: the cached leaf would be guest-physical, so always
+    // walk in that case. Mirrors the fetch-TLB combinational lookup above.
+    final dtlbUsable = hasTwoStage ? ~twoStage : Const(1);
+    final dtlbHit = hasPaging
+        ? (dtlbValid &
+              ~satpChanged &
+              dtlbUsable &
+              // A write to a page cached not-yet-dirty (D=0, bit 7) must re-walk
+              // so the Svadu writeback sets the D bit; reads always hit (A is
+              // already set on the cached leaf).
+              ~(dportWe & ~dtlbPte[7]) &
+              dportAddr.slice(xlen - 1, 12).eq(dtlbVpn))
+        : Const(0);
+    final dtlbPermFault = hasPaging
+        ? leafPermFault(dtlbPte, Const(0), dportWe)
+        : Const(0);
+    // Svadu hardware A/D update (single-stage only; two-stage A/D is deferred).
+    // After a leaf read, set A (bit 6) and, for a write, D (bit 7); if the bit
+    // was not already set, write the updated PTE back before the access.
+    final adABit = Const(1, width: xlen) << 6;
+    final adDBit = Const(1, width: xlen) << 7;
+    final pteWithAd = hasPaging
+        ? wbDatMiso | adABit | mux(reqWe, adDBit, Const(0, width: xlen))
+        : Const(0, width: xlen);
+    final adDoWrite = hasPaging
+        ? ((~wbDatMiso[6] | (reqWe & ~wbDatMiso[7])) & dtlbUsable)
+        : Const(0);
+    final dtlbPa = hasPaging
+        ? leafPa(dtlbPte, dportAddr)
+        : Const(0, width: xlen);
 
     Sequential(clk, [
       If(
         reset,
         then: [
-          for (final memReadPort in memReadPorts) ...[
-            memReadPort.$2.done < 0,
-            memReadPort.$2.valid < 0,
-            memReadPort.$2.data < 0,
+          arbState < 0,
+          busActive < 0,
+          justCompleted < 0,
+          ifDoneR < 0,
+          ifValidR < 0,
+          ifRdataR < 0,
+          dpDoneR < 0,
+          dpValidR < 0,
+          dpRdataR < 0,
+          dpFaultR < 0,
+          dpFaultGuestR < 0,
+          ifFaultR < 0,
+          isFetchWalk < 0,
+          adWrite < 0,
+          adTransPa < 0,
+          ftlbValid < 0,
+          ftlbVpn < 0,
+          dtlbValid < 0,
+          dtlbVpn < 0,
+          dtlbPte < 0,
+          ftlbPte < 0,
+          satpShadowMode < 0,
+          satpShadowRoot < 0,
+          privShadow < 0,
+          cycR < 0,
+          stbR < 0,
+          weR < 0,
+          adrR < 0,
+          datMosiR < 0,
+          selR < 0,
+          walking < 0,
+          walkArmed < 0,
+          walkAddr < 0,
+          walkLevel < 0,
+          reqAddr < 0,
+          reqWe < 0,
+          reqWdata < 0,
+          reqSize < 0,
+          if (hasTwoStage) ...[
+            gWalking < 0,
+            gWalkArmed < 0,
+            gWalkAddr < 0,
+            gWalkLevel < 0,
+            gReqAddr < 0,
+            gTranslated < 0,
+            gSaveWe < 0,
+            gSaveData < 0,
+            gSaveSel < 0,
           ],
-          for (final memWritePort in memWritePorts) ...[
-            memWritePort.$2.done < 0,
-            memWritePort.$2.valid < 0,
-          ],
-          for (final dev in devices.values) ...[
-            if (dev.$1 != null) ...[dev.$1!.en < 0, dev.$1!.addr < 0],
-            if (dev.$2 != null) ...[dev.$2!.en < 0, dev.$2!.addr < 0],
-          ],
-          devReadBusy < 0,
-          devReadEnable < 0,
-          devReadDone < 0,
-          devReadValid < 0,
-          devReadClaim < 0,
-          devWriteBusy < 0,
-          devWriteEnable < 0,
-          devWriteDone < 0,
-          devWriteClaim < 0,
-          ...pagingReset,
         ],
         orElse: [
-          ...pagingCycle,
-          for (final memPort in [
-            ...memReadPorts,
-            ...memWritePorts,
-          ].map((e) => e.$2))
-            If(~memPort.en, then: [memPort.done < 0, memPort.valid < 0]),
+          ifDoneR < 0,
+          ifValidR < 0,
+          dpDoneR < 0,
+          dpValidR < 0,
+          dpFaultR < 0,
+          dpFaultGuestR < 0,
+          ifFaultR < 0,
+          justCompleted < 0,
+          privShadow < (priv ?? Const(0, width: 3)),
+          // Track satp so the fetch-TLB self-invalidates when it changes, and
+          // flush it on sfence.vma (tlbFlushIn).
+          if (hasPaging) ...[
+            satpShadowMode < satpMode!,
+            satpShadowRoot < satpRoot!,
+            If(satpChanged | tlbFlushIn, then: [ftlbValid < 0, dtlbValid < 0]),
+            // DTLBFC: also drop the data TLB on a privilege-mode change (satp
+            // changes already flushed above) so a cached translation never
+            // survives a context switch on a paranoid config.
+            If(dtlbFlushOnPrivIn & privChanged, then: [dtlbValid < 0]),
+          ],
+
           If.block([
-            for (final memReadPort in memReadPorts.indexed)
-              ...defineReadPort(
-                memReadPort.$2.$1,
-                memReadPort.$2.$2,
-                memReadPort.$1 + 2,
-              ),
-            for (final memWritePort in memWritePorts.indexed)
-              ...defineWritePort(
-                memWritePort.$2.$1,
-                memWritePort.$2.$2,
-                memWritePort.$1 + 2,
-              ),
-          ]),
-          If(
-            devReadEnable,
-            then: [
-              if (devices.isEmpty) ...[
-                devReadDone < 1,
-                devReadData < 0,
-                devReadValid < 0,
-              ] else
+            // G-stage (second-stage) PTE returned. (checked first: during a
+            // G sub-walk both gWalking and walking may be set). Resolves the
+            // host-physical address for the pending VS access, then resumes it.
+            if (hasTwoStage)
+              Iff(busActive & wbAck & gWalking, [
+                cycR < 0,
+                stbR < 0,
                 If.block([
-                  for (final dev in devices.entries)
-                    Iff(
-                      devReadAddr.gte(dev.key.start) &
-                          devReadAddr.lt(dev.key.end),
-                      dev.value.$1 != null
-                          ? [
-                              dev.value.$1!.en < devReadBusy,
-                              dev.value.$1!.addr <
-                                  (devReadAddr -
-                                          Const(
-                                            dev.key.start,
-                                            width: config.mxlen.size,
-                                          ))
-                                      .slice(dev.value.$1!.addr.width - 1, 0),
-                              devReadData <
-                                  dev.value.$1!.data.zeroExtend(
-                                    config.mxlen.size,
-                                  ),
-                              devReadDone < dev.value.$1!.done,
-                              devReadValid < dev.value.$1!.valid,
-                            ]
-                          : [
-                              devReadData < 0,
-                              devReadDone < 1,
-                              devReadValid < 0,
-                            ],
+                  // Invalid G-PTE -> guest page fault.
+                  Iff(pteInvalid(wbDatMiso), [
+                    gWalking < 0,
+                    gWalkArmed < 0,
+                    walking < 0,
+                    walkArmed < 0,
+                    busActive < 0,
+                    justCompleted < 1,
+                    dpDoneR < 1,
+                    dpValidR < 0,
+                    dpFaultR < 1,
+                    dpFaultGuestR < 1,
+                    arbState < 0,
+                  ]),
+                  // G leaf. Every G-stage leaf page must be user-accessible
+                  // (PTE.U=bit4), a non-U G-leaf is a guest page fault. When
+                  // OK, walkAddr is now host-physical; re-arm the VS access
+                  // (gTranslated=1 makes the launch fire directly) and restore
+                  // its original write controls.
+                  Iff(pteLeaf(wbDatMiso), [
+                    If(
+                      ~wbDatMiso[4],
+                      then: [
+                        gWalking < 0,
+                        gWalkArmed < 0,
+                        walking < 0,
+                        walkArmed < 0,
+                        busActive < 0,
+                        justCompleted < 1,
+                        dpDoneR < 1,
+                        dpValidR < 0,
+                        dpFaultR < 1,
+                        dpFaultGuestR < 1,
+                        arbState < 0,
+                      ],
+                      orElse: [
+                        gWalking < 0,
+                        gTranslated < 1,
+                        walkArmed < 1,
+                        walkAddr < leafPa(wbDatMiso, gReqAddr),
+                        weR < gSaveWe,
+                        datMosiR < gSaveData,
+                        selR < gSaveSel,
+                      ],
                     ),
-                  Else([devReadDone < 1, devReadData < 0, devReadValid < 0]),
+                  ]),
+                  // No leaf at the last level -> guest page fault.
+                  Iff(~gWalkLevel.or(), [
+                    gWalking < 0,
+                    gWalkArmed < 0,
+                    walking < 0,
+                    walkArmed < 0,
+                    busActive < 0,
+                    justCompleted < 1,
+                    dpDoneR < 1,
+                    dpValidR < 0,
+                    dpFaultR < 1,
+                    dpFaultGuestR < 1,
+                    arbState < 0,
+                  ]),
+                  // Pointer G-PTE -> descend.
+                  Iff(Const(1), [
+                    gWalkLevel < (gWalkLevel - 1),
+                    gWalkArmed < 1,
+                    gWalkAddr <
+                        ptePtr(
+                          pteNextBase(wbDatMiso),
+                          vpnOf(gReqAddr, gWalkLevel - 1),
+                        ),
+                  ]),
                 ]),
-            ],
-            orElse: [devReadDone < 0, devReadData < 0, devReadValid < 0],
-          ),
-          If(
-            devWriteEnable,
-            then: [
-              if (devices.isEmpty) ...[
-                devWriteDone < 1,
-                devWriteValid < 0,
-              ] else
+              ]),
+
+            // Page-table walk: a PTE just came back.
+            if (hasPaging)
+              Iff(busActive & wbAck & walking & ~(hasTwoStage ? gWalking : Const(0)), [
+                // End this PTE's transaction.
+                cycR < 0,
+                stbR < 0,
                 If.block([
-                  for (final dev in devices.entries)
-                    Iff(
-                      devWriteAddr.gte(dev.key.start) &
-                          devWriteAddr.lt(dev.key.end),
-                      dev.value.$2 != null
-                          ? [
-                              dev.value.$2!.en < devWriteBusy,
-                              dev.value.$2!.addr <
-                                  (devWriteAddr -
-                                          Const(
-                                            dev.key.start,
-                                            width: config.mxlen.size,
-                                          ))
-                                      .slice(dev.value.$2!.addr.width - 1, 0),
-                              dev.value.$2!.data <
-                                  devWriteData.slice(
-                                    dev.value.$2!.data.width - 1,
-                                    0,
-                                  ),
-                              devWriteDone < dev.value.$2!.done,
-                              devWriteValid < dev.value.$2!.valid,
-                              If(
-                                dev.value.$2!.done,
-                                then: [dev.value.$2!.en < 0],
+                  // Invalid PTE (V=0 or reserved W&&!R) -> page fault.
+                  Iff(pteInvalid(wbDatMiso), [
+                    walking < 0,
+                    walkArmed < 0,
+                    busActive < 0,
+                    justCompleted < 1,
+                    dpDoneR < ~isFetchWalk,
+                    dpValidR < 0,
+                    dpFaultR < ~isFetchWalk,
+                    ifDoneR < isFetchWalk,
+                    ifValidR < 0,
+                    ifFaultR < isFetchWalk,
+                    arbState < 0,
+                  ]),
+                  // Leaf PTE.
+                  Iff(pteLeaf(wbDatMiso), [
+                    If(
+                      leafPermFault(wbDatMiso, isFetchWalk, reqWe),
+                      then: [
+                        // Permission violation -> page fault.
+                        walking < 0,
+                        walkArmed < 0,
+                        busActive < 0,
+                        justCompleted < 1,
+                        dpDoneR < ~isFetchWalk,
+                        dpValidR < 0,
+                        dpFaultR < ~isFetchWalk,
+                        ifDoneR < isFetchWalk,
+                        ifValidR < 0,
+                        ifFaultR < isFetchWalk,
+                        arbState < 0,
+                      ],
+                      orElse: [
+                        // Arm the final translated access (guest-physical when
+                        // two-stage: gTranslated<0 makes it G-translate first).
+                        // Cache the walked leaf so a same-page re-access skips
+                        // the walk (4KB leaves only). Fetch leaf -> ftlb, data
+                        // leaf -> dtlb (single-stage only, dtlbUsable gates out
+                        // guest leaves). Cache the A/D-updated leaf so a hit
+                        // reflects the post-Svadu state.
+                        If(
+                          isFetchWalk,
+                          then: [
+                            ftlbValid < 1,
+                            ftlbVpn < reqAddr.slice(xlen - 1, 12),
+                            ftlbPte < pteWithAd,
+                          ],
+                          orElse: [
+                            If(
+                              dtlbUsable,
+                              then: [
+                                dtlbValid < 1,
+                                dtlbVpn < reqAddr.slice(xlen - 1, 12),
+                                dtlbPte < pteWithAd,
+                              ],
+                            ),
+                          ],
+                        ),
+                        walking < 0,
+                        If(
+                          adDoWrite,
+                          then: [
+                            // Svadu: write the updated PTE (A, and D on a write)
+                            // back to its address (walkAddr still holds the PTE
+                            // pointer), then resume with the translated access.
+                            adWrite < 1,
+                            adTransPa < leafPa(wbDatMiso, reqAddr),
+                            walkArmed < 1,
+                            weR < 1,
+                            datMosiR < pteWithAd,
+                            selR < fullSel,
+                          ],
+                          orElse: [
+                            // A/D already set: arm the translated access directly.
+                            walkArmed < 1,
+                            walkAddr < leafPa(wbDatMiso, reqAddr),
+                            weR < reqWe,
+                            datMosiR < reqWdata,
+                            // A fetch reads a full word; a dport uses its size.
+                            selR < mux(isFetchWalk, fullSel, sizeSel(reqSize)),
+                            if (hasTwoStage) gTranslated < 0,
+                          ],
+                        ),
+                      ],
+                    ),
+                  ]),
+                  // Non-leaf at the last level (no leaf found) -> page fault.
+                  Iff(~walkLevel.or(), [
+                    walking < 0,
+                    walkArmed < 0,
+                    busActive < 0,
+                    justCompleted < 1,
+                    dpDoneR < ~isFetchWalk,
+                    dpValidR < 0,
+                    dpFaultR < ~isFetchWalk,
+                    ifDoneR < isFetchWalk,
+                    ifValidR < 0,
+                    ifFaultR < isFetchWalk,
+                    arbState < 0,
+                  ]),
+                  // Pointer PTE, descend to the next level.
+                  Iff(Const(1), [
+                    walkLevel < (walkLevel - 1),
+                    walkArmed < 1,
+                    walkAddr <
+                        ptePtr(
+                          pteNextBase(wbDatMiso),
+                          vpnOf(reqAddr, walkLevel - 1),
+                        ),
+                    weR < 0,
+                    datMosiR < 0,
+                    selR < fullSel,
+                    if (hasTwoStage) gTranslated < 0,
+                  ]),
+                ]),
+              ]),
+
+            // Svadu A/D PTE writeback completed: resume with the access.
+            if (hasPaging)
+              Iff(busActive & wbAck & adWrite, [
+                cycR < 0,
+                stbR < 0,
+                adWrite < 0,
+                walkArmed < 1,
+                walkAddr < adTransPa,
+                weR < reqWe,
+                datMosiR < reqWdata,
+                selR < mux(isFetchWalk, fullSel, sizeSel(reqSize)),
+                if (hasTwoStage) gTranslated < 0,
+              ]),
+
+            // ACK received, complete the (non-walk) transaction.
+            if (hasPaging)
+              Iff(busActive & wbAck & ~walking & ~adWrite, [
+                cycR < 0,
+                stbR < 0,
+                busActive < 0,
+                justCompleted < 1,
+                If(
+                  arbState.eq(1),
+                  then: [
+                    // Wishbone byte-lane convention: a sub-word load reads an
+                    // aligned word with the addressed byte in its lane, so shift
+                    // it back to lane 0 (mirrors the write path's lane shift);
+                    // else e.g. `lbu` at byte offset 5 reads the wrong byte.
+                    // Ifetch stays unshifted (the fetch unit extracts its own).
+                    dpRdataR <
+                        (wbDatMiso >>
+                            [
+                              adrR.getRange(
+                                0,
+                                (busConfig.effectiveSelWidth - 1).bitLength,
                               ),
-                            ]
-                          : [devWriteDone < 1, devWriteValid < 0],
+                              Const(0, width: 3),
+                            ].swizzle()),
+                    dpDoneR < 1,
+                    dpValidR < 1,
+                  ],
+                ),
+                If(
+                  arbState.eq(2),
+                  then: [ifRdataR < wbDatMiso, ifDoneR < 1, ifValidR < 1],
+                ),
+                arbState < 0,
+              ])
+            else
+              Iff(busActive & wbAck, [
+                cycR < 0,
+                stbR < 0,
+                busActive < 0,
+                justCompleted < 1,
+                If(
+                  arbState.eq(1),
+                  then: [
+                    // Wishbone byte-lane convention: a sub-word load reads an
+                    // aligned word with the addressed byte in its lane, so shift
+                    // it back to lane 0 (mirrors the write path's lane shift);
+                    // else e.g. `lbu` at byte offset 5 reads the wrong byte.
+                    // Ifetch stays unshifted (the fetch unit extracts its own).
+                    dpRdataR <
+                        (wbDatMiso >>
+                            [
+                              adrR.getRange(
+                                0,
+                                (busConfig.effectiveSelWidth - 1).bitLength,
+                              ),
+                              Const(0, width: 3),
+                            ].swizzle()),
+                    dpDoneR < 1,
+                    dpValidR < 1,
+                  ],
+                ),
+                If(
+                  arbState.eq(2),
+                  then: [ifRdataR < wbDatMiso, ifDoneR < 1, ifValidR < 1],
+                ),
+                arbState < 0,
+              ]),
+
+            // Launch an armed walk access once the bus is idle.
+            // With two-stage active, the armed (guest-physical) address is first
+            // diverted through a G-stage sub-walk; once gTranslated, it launches.
+            if (hasPaging && hasTwoStage)
+              Iff(busActive & walkArmed & ~cycR, [
+                walkArmed < 0,
+                If(
+                  twoStage & ~gTranslated,
+                  then: [
+                    gSaveWe < weR,
+                    gSaveData < datMosiR,
+                    gSaveSel < selR,
+                    gWalking < 1,
+                    gWalkLevel < gStartLevel,
+                    gReqAddr < walkAddr,
+                    gWalkArmed < 1,
+                    gWalkAddr < ptePtr(gRootBase, vpnOf(walkAddr, gStartLevel)),
+                    weR < 0,
+                    datMosiR < 0,
+                    selR < fullSel,
+                  ],
+                  orElse: [cycR < 1, stbR < 1, adrR < walkAddr],
+                ),
+              ])
+            else if (hasPaging)
+              Iff(busActive & walkArmed & ~cycR, [
+                walkArmed < 0,
+                cycR < 1,
+                stbR < 1,
+                adrR < walkAddr,
+              ]),
+
+            // Launch an armed G-stage (second-stage) walk access.
+            if (hasTwoStage)
+              Iff(busActive & gWalkArmed & ~cycR, [
+                gWalkArmed < 0,
+                cycR < 1,
+                stbR < 1,
+                adrR < gWalkAddr,
+                weR < 0,
+                datMosiR < 0,
+                selR < fullSel,
+              ]),
+
+            // Bus active, waiting
+            Iff(busActive, []),
+
+            // Idle, arbitrate (dport > ifetch); pause one cycle after a
+            // completion so the requester can update its address first.
+            Iff(~busActive & ~justCompleted & dportEn, [
+              arbState < 1,
+              busActive < 1,
+              isFetchWalk < 0,
+              if (hasPaging)
+                If(
+                  pagingOn,
+                  then: [
+                    If(
+                      dtlbHit,
+                      then: [
+                        // Data-TLB hit: skip the walk. Re-check the permission on
+                        // the cached leaf (priv/we may differ from when cached).
+                        walking < 0,
+                        If(
+                          dtlbPermFault,
+                          then: [
+                            // Permission violation -> page fault.
+                            busActive < 0,
+                            justCompleted < 1,
+                            dpDoneR < 1,
+                            dpValidR < 0,
+                            dpFaultR < 1,
+                            arbState < 0,
+                          ],
+                          orElse: [
+                            // Direct translated access at the cached PA.
+                            cycR < 1,
+                            stbR < 1,
+                            adrR < dtlbPa,
+                            weR < dportWe,
+                            datMosiR < dportWdata,
+                            selR < sizeSel(dportSize),
+                          ],
+                        ),
+                      ],
+                      orElse: [
+                        // TLB miss: start the page-table walk. Latch the request
+                        // and arm the root PTE fetch (launched next cycle).
+                        walking < 1,
+                        walkLevel < startLevel,
+                        reqAddr < dportAddr,
+                        reqWe < dportWe,
+                        reqWdata < dportWdata,
+                        reqSize < dportSize,
+                        walkArmed < 1,
+                        walkAddr <
+                            ptePtr(rootBase, vpnOf(dportAddr, startLevel)),
+                        weR < 0,
+                        datMosiR < 0,
+                        selR < fullSel,
+                        // The VS root pointer is guest-physical under two-stage.
+                        if (hasTwoStage) gTranslated < 0,
+                      ],
                     ),
-                  Else([devWriteDone < 1, devWriteValid < 0]),
-                ]),
-            ],
-            orElse: [devWriteDone < 0, devWriteValid < 0],
-          ),
+                  ],
+                  orElse: [
+                    walking < 0,
+                    cycR < 1,
+                    stbR < 1,
+                    adrR < dportAddr,
+                    weR < dportWe,
+                    datMosiR < dportWdata,
+                    selR < sizeSel(dportSize),
+                  ],
+                )
+              else ...[
+                cycR < 1,
+                stbR < 1,
+                adrR < dportAddr,
+                weR < dportWe,
+                datMosiR < dportWdata,
+                selR < sizeSel(dportSize),
+              ],
+            ]),
+
+            Iff(~busActive & ~justCompleted & ~dportEn & ifetchEn, [
+              arbState < 2,
+              busActive < 1,
+              if (hasPaging && translateFetch)
+                If(
+                  fetchPagingOn,
+                  then: [
+                    If(
+                      ftlbHit,
+                      then: [
+                        // Fetch-TLB hit: skip the walk. Re-check the fetch
+                        // permission on the cached leaf (priv may have changed).
+                        If(
+                          ftlbPermFault,
+                          then: [
+                            // Not fetchable now -> instruction page fault.
+                            isFetchWalk < 0,
+                            walking < 0,
+                            busActive < 0,
+                            justCompleted < 1,
+                            ifDoneR < 1,
+                            ifValidR < 0,
+                            ifFaultR < 1,
+                            arbState < 0,
+                          ],
+                          orElse: [
+                            // Direct fetch at the cached physical address.
+                            isFetchWalk < 0,
+                            walking < 0,
+                            cycR < 1,
+                            stbR < 1,
+                            adrR < ftlbPa,
+                            weR < 0,
+                            datMosiR < 0,
+                            selR < fullSel,
+                          ],
+                        ),
+                      ],
+                      orElse: [
+                        // TLB miss: walk the page table for ifetchAddr as an
+                        // instruction access. isFetchWalk routes the X-permission
+                        // check, the fault, and the result to the ifetch ports,
+                        // and the leaf is cached for subsequent re-fetches.
+                        isFetchWalk < 1,
+                        walking < 1,
+                        walkLevel < startLevel,
+                        reqAddr < ifetchAddr,
+                        reqWe < 0,
+                        reqWdata < 0,
+                        reqSize < Const(3, width: 3),
+                        walkArmed < 1,
+                        walkAddr <
+                            ptePtr(rootBase, vpnOf(ifetchAddr, startLevel)),
+                        weR < 0,
+                        datMosiR < 0,
+                        selR < fullSel,
+                        if (hasTwoStage) gTranslated < 0,
+                      ],
+                    ),
+                  ],
+                  orElse: [
+                    isFetchWalk < 0,
+                    walking < 0,
+                    cycR < 1,
+                    stbR < 1,
+                    adrR < ifetchAddr,
+                    weR < 0,
+                    datMosiR < 0,
+                    selR < fullSel,
+                  ],
+                )
+              else ...[
+                cycR < 1,
+                stbR < 1,
+                adrR < ifetchAddr,
+                weR < 0,
+                datMosiR < 0,
+                selR < fullSel,
+              ],
+            ]),
+          ]),
         ],
       ),
     ]);
+
+    // Drive outputs from registers
+    ifetchDone <= ifDoneR;
+    ifetchValid <= ifValidR;
+    ifetchRdata <= ifRdataR;
+    dportDone <= dpDoneR;
+    dportValid <= dpValidR;
+    dportRdata <= dpRdataR;
+    dportFault <= dpFaultR;
+    ifetchFault <= ifFaultR;
+    dportFaultGuest <= dpFaultGuestR;
+    wbCyc <= cycR;
+    wbStb <= stbR;
+    wbWe <= weR;
+    // Wishbone byte-lane convention at the bus boundary. The FSM tracks exact
+    // byte addresses, lane-0 write data, and an unshifted size mask in selR; the
+    // bus carries a word-aligned address with the byte position in SEL and the
+    // data shifted into its lane. Walk accesses are word-aligned with fullSel,
+    // so this is the identity for them.
+    final laneBits = (busConfig.effectiveSelWidth - 1).bitLength;
+    final busLane = adrR.getRange(0, laneBits).named('busLane');
+    wbAdr <=
+        [
+          adrR.getRange(laneBits, busConfig.addressWidth),
+          Const(0, width: laneBits),
+        ].swizzle();
+    wbDatMosi <= datMosiR << [busLane, Const(0, width: 3)].swizzle();
+    wbSel <= selR << busLane;
   }
 }

@@ -1,0 +1,21 @@
+name: river_maskrom
+description: Maskrom firmware generator for River SoCs.
+version: 1.0.0
+resolution: workspace
+
+environment:
+  sdk: ^3.11.2
+
+dependencies:
+  bintools: ^1.0.0
+  harbor: ^0.0.1
+  river: ^1.0.0
+  river_adl: ^1.0.0
+
+dev_dependencies:
+  lints: ^6.0.0
+  river_emulator: ^1.0.0
+  river_hdl: ^1.0.0
+  rohd: ^0.6.8
+  rohd_hcl: ^0.2.1
+  test: ^1.28.0
