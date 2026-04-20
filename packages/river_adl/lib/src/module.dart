@@ -1,6 +1,10 @@
-import 'package:riscv/riscv.dart' show Register;
+import 'package:harbor/harbor.dart';
+import 'package:river/river.dart' show Register;
+
 import 'data.dart';
 import 'instr.dart';
+import 'instruction_set.dart';
+import 'package:bintools/bintools.dart';
 
 class _LiveInterval {
   int vreg;
@@ -11,12 +15,10 @@ class _LiveInterval {
 }
 
 class _RegisterAllocator {
-  int nextRegIndex = 4; // start at x4
+  int nextRegIndex = 4;
   final Map<int, int> _vregToIndex = {};
   final List<int> _free = [];
   final Set<int> _reserved = {0};
-
-  _RegisterAllocator();
 
   void run(
     List<Instruction> instructions,
@@ -32,18 +34,16 @@ class _RegisterAllocator {
       }
     }
 
-    int _allocIndexSkippingReserved() {
+    int allocIndexSkippingReserved() {
       while (_reserved.contains(nextRegIndex)) {
         nextRegIndex++;
       }
       return nextRegIndex++;
     }
 
-    int _allocIndex() {
-      if (_free.isNotEmpty) {
-        return _free.removeLast();
-      }
-      return _allocIndexSkippingReserved();
+    int allocIndex() {
+      if (_free.isNotEmpty) return _free.removeLast();
+      return allocIndexSkippingReserved();
     }
 
     for (final out in outputFields) {
@@ -58,7 +58,7 @@ class _RegisterAllocator {
         continue;
       }
 
-      final idx = _allocIndexSkippingReserved();
+      final idx = allocIndexSkippingReserved();
       _vregToIndex[v] = idx;
       _reserved.add(idx);
     }
@@ -72,7 +72,7 @@ class _RegisterAllocator {
 
     final active = <_LiveInterval>[];
 
-    void _expireOld(int position) {
+    void expireOld(int position) {
       active.removeWhere((iv) {
         if (iv.end < position) {
           final idx = _vregToIndex[iv.vreg];
@@ -86,14 +86,14 @@ class _RegisterAllocator {
     }
 
     for (final iv in intervalList) {
-      _expireOld(iv.start);
+      expireOld(iv.start);
 
       if (_vregToIndex.containsKey(iv.vreg)) {
         active.add(iv);
         continue;
       }
 
-      final idx = _allocIndex();
+      final idx = allocIndex();
       _vregToIndex[iv.vreg] = idx;
       active.add(iv);
     }
@@ -110,7 +110,6 @@ class _RegisterAllocator {
 
   void _recordPinned(DataField f) {
     if (f.vreg == null || f.assignedRegister == null) return;
-
     final idx = f.assignedRegister!.value;
     _reserved.add(idx);
     _vregToIndex[f.vreg!] = idx;
@@ -118,19 +117,27 @@ class _RegisterAllocator {
 
   void _assignField(DataField f) {
     if (f.assignedRegister != null) return;
-
     final vreg = f.vreg;
     if (vreg == null) return;
-
-    final idx = _vregToIndex[vreg];
-    if (idx == null || idx >= Register.values.length) return;
-
+    var idx = _vregToIndex[vreg];
+    if (idx == null) {
+      // Vreg not mapped yet -- allocate on the fly
+      while (_reserved.contains(nextRegIndex)) {
+        nextRegIndex++;
+      }
+      idx = nextRegIndex++;
+      _vregToIndex[vreg] = idx;
+    }
+    if (idx >= Register.values.length) return;
     f.assignedRegister = Register.values[idx];
   }
 }
 
-abstract class Module {
+abstract class Module with InstructionSet {
   static Module? current;
+
+  @override
+  Module get currentModule => this;
 
   final Map<String, DataField> inputs = {};
   final Map<String, DataField> outputs = {};
@@ -143,6 +150,8 @@ abstract class Module {
     current = this;
   }
 
+  int nextSsaId() => _nextSSA++;
+
   DataField field(DataType type, {String? name}) =>
       DataField(type, ssaId: _nextSSA++, name: name, module: this);
 
@@ -150,16 +159,22 @@ abstract class Module {
   DataField output(String name) => outputs[name]!;
 
   DataField addInput(String name, DataField field) {
-    final input = field.copyWith(ssaId: _nextSSA++, name: name, module: this);
-
-    if (input.producer != null) {
-      final inst = input.producer!.assignOutput(input);
-      instructions.add(inst);
-      input.producer = inst;
+    if (field.pendingImm != null) {
+      final resolved = li(field.pendingImm!);
+      inputs[name] = resolved;
+      return resolved;
     }
 
-    inputs[name] = input;
-    return input;
+    final inp = field.copyWith(ssaId: _nextSSA++, name: name, module: this);
+
+    if (inp.producer != null) {
+      final inst = inp.producer!.assignOutput(inp);
+      instructions.add(inst);
+      inp.producer = inst;
+    }
+
+    inputs[name] = inp;
+    return inp;
   }
 
   DataField addOutput(
@@ -185,16 +200,15 @@ abstract class Module {
   }
 
   DataField register(Register reg) {
-    if (outputs.containsKey(reg.abi)) {
-      return outputs[reg.abi]!;
+    if (!outputs.containsKey(reg.abi)) {
+      outputs[reg.abi] = DataField.register(
+        reg,
+        ssaId: _nextSSA++,
+        name: reg.abi,
+        module: this,
+      );
     }
 
-    outputs[reg.abi] = DataField.register(
-      reg,
-      ssaId: _nextSSA++,
-      name: reg.abi,
-      module: this,
-    );
     return outputs[reg.abi]!;
   }
 
@@ -202,50 +216,77 @@ abstract class Module {
 
   String generateAssembly() {
     final asm = StringBuffer();
-
     for (final inst in _built) {
       asm.writeln(inst.toAsm());
     }
-
     return asm.toString();
   }
 
-  List<int> generateBinary() {
+  List<int> generateBinary({int baseAddress = 0}) {
     final bytes = <int>[];
+    var offset = 0;
+    for (final inst in _built) {
+      if (inst is LabelInstruction) continue;
+      bytes.addAll(inst.toBinary(pc: offset));
+      offset += 4;
+    }
+    return bytes;
+  }
+
+  Section emitToSection({String name = '.text', int baseAddress = 0}) {
+    final section = Section(name, type: SectionType.text);
+    var offset = 0;
 
     for (final inst in _built) {
-      bytes.addAll(inst.toBinary());
+      if (inst is LabelInstruction) {
+        section.addSymbol(inst.label!.name);
+        continue;
+      }
+
+      if (inst.label != null && !inst.label!.isResolved) {
+        section.addRelocation(
+          Relocation(
+            offset: section.size,
+            symbol: inst.label!.name,
+            type: inst.op.format == bType
+                ? RelocationType.branch
+                : RelocationType.jal,
+          ),
+        );
+      }
+
+      section.emitBytes(inst.toBinary(pc: offset));
+      offset += 4;
     }
 
-    return bytes;
+    return section;
+  }
+
+  void _resolveLabels() {
+    var offset = 0;
+    for (final inst in _built) {
+      if (inst is LabelInstruction) {
+        inst.label!.resolve(offset);
+      } else {
+        offset += 4;
+      }
+    }
   }
 
   void _clearState(List<Instruction> instrs) {
     _nextSSA = 0;
-
     for (final instr in instrs) {
       if (instr.output != null) {
         final output = instr.output!;
         if (output.module == this) {
           output.ssaId = null;
           output.vreg = null;
-
-          if (output.assignedRegister != null) {
-            final reg = output.assignedRegister!;
-            if (reg.value >= 4) output.assignedRegister = null;
-          }
         }
       }
-
       for (final input in instr.inputs) {
         if (input.module == this) {
           input.ssaId = null;
           input.vreg = null;
-
-          if (input.assignedRegister != null) {
-            final reg = input.assignedRegister!;
-            if (reg.value >= 4) input.assignedRegister = null;
-          }
         }
       }
     }
@@ -256,60 +297,76 @@ abstract class Module {
     for (final instr in instrs) {
       for (final input in instr.inputs) {
         if (input.module == this) {
-          if (input.ssaId == null) {
-            input.ssaId = _nextSSA++;
-          }
-
-          if (input.vreg == null) {
-            input.vreg = nextVreg++;
-          }
+          input.ssaId ??= _nextSSA++;
+          input.vreg ??= nextVreg++;
         }
       }
-
-      if (instr.output != null) {
-        if (instr.output!.module == this) {
-          if (instr.output!.ssaId == null) {
-            instr.output!.ssaId = _nextSSA++;
-          }
-
-          if (instr.output!.vreg == null) {
-            instr.output!.vreg = nextVreg++;
-          }
-        }
+      if (instr.output != null && instr.output!.module == this) {
+        instr.output!.ssaId ??= _nextSSA++;
+        instr.output!.vreg ??= nextVreg++;
       }
     }
   }
 
   List<Instruction> _topoSort(List<Instruction> instrs) {
-    final visited = <Instruction>{};
     final sorted = <Instruction>[];
 
-    void visit(Instruction inst) {
-      if (visited.contains(inst)) return;
-      visited.add(inst);
+    // Split at labels, topo-sort each segment independently
+    final segments = <List<Instruction>>[];
+    var current = <Instruction>[];
+    for (final inst in instrs) {
+      if (inst is LabelInstruction) {
+        segments.add(current);
+        segments.add([inst]);
+        current = [];
+      } else {
+        current.add(inst);
+      }
+    }
+    segments.add(current);
 
-      for (final input in inst.inputs) {
-        final prod = input.producer;
-        if (prod != null) {
-          visit(prod);
+    final visited = <Instruction>{};
+
+    for (final segment in segments) {
+      void visit(Instruction inst) {
+        if (visited.contains(inst)) return;
+        visited.add(inst);
+        for (final input in inst.inputs) {
+          if (input.producer != null) visit(input.producer!);
         }
+        sorted.add(inst);
       }
 
-      sorted.add(inst);
+      for (final inst in segment) {
+        visit(inst);
+      }
     }
-
-    for (final inst in instrs) visit(inst);
 
     return sorted;
   }
 
   List<Instruction> _removeDeadCode(List<Instruction> instrs) {
-    final liveInstructions = <Instruction>{};
+    final live = <Instruction>{};
     final worklist = <DataField>[];
 
     for (final out in outputs.values) {
-      if (out.producer != null) {
-        worklist.add(out);
+      if (out.producer != null) worklist.add(out);
+    }
+
+    // Side-effect instructions are always live; seed their inputs too. A write to
+    // an explicitly pinned register (set via register(xN).bind(...)) is also
+    // seeded: pinning is intent to hold state across control flow the SSA
+    // dataflow does not model (loop back-edges, branch merges). Without it a
+    // pointer incremented at a loop bottom and consumed at the top (across the
+    // back-edge) has no forward producer-use and is wrongly eliminated.
+    for (final inst in instrs) {
+      final pinnedWrite =
+          inst.output?.assignedRegister != null &&
+          inst.output?.assignedRegister != Register.x0;
+      if ((inst.hasSideEffects || pinnedWrite) && live.add(inst)) {
+        for (final input in inst.inputs) {
+          if (input.producer != null) worklist.add(input);
+        }
       }
     }
 
@@ -317,18 +374,14 @@ abstract class Module {
       final field = worklist.removeLast();
       final instr = field.producer;
       if (instr == null) continue;
-      if (liveInstructions.add(instr)) {
+      if (live.add(instr)) {
         for (final input in instr.inputs) {
-          if (input.producer != null) {
-            worklist.add(input);
-          }
+          if (input.producer != null) worklist.add(input);
         }
       }
     }
 
-    return instrs
-        .where((i) => liveInstructions.contains(i) || i.hasSideEffects)
-        .toList();
+    return instrs.where((i) => live.contains(i)).toList();
   }
 
   Map<int, _LiveInterval> _computeLiveIntervals(List<Instruction> instrs) {
@@ -336,13 +389,11 @@ abstract class Module {
 
     for (int i = 0; i < instrs.length; i++) {
       final inst = instrs[i];
-
       for (final input in inst.inputs) {
         if (input.vreg == null) continue;
         final v = input.vreg!;
         intervals.putIfAbsent(v, () => _LiveInterval(v, i, i)).end = i;
       }
-
       if (inst.output != null && inst.output!.vreg != null) {
         final v = inst.output!.vreg!;
         intervals.putIfAbsent(v, () => _LiveInterval(v, i, i)).start = i;
@@ -357,9 +408,7 @@ abstract class Module {
         v,
         () => _LiveInterval(v, lastIdx, lastIdx),
       );
-      if (iv.end < lastIdx) {
-        iv.end = lastIdx;
-      }
+      if (iv.end < lastIdx) iv.end = lastIdx;
     }
 
     return intervals;
@@ -370,10 +419,10 @@ abstract class Module {
     _built = _removeDeadCode(_built);
     _clearState(_built);
     _computeState(_built);
+    _resolveLabels();
 
     final intervals = _computeLiveIntervals(_built);
-
-    var regAlloc = _RegisterAllocator();
+    final regAlloc = _RegisterAllocator();
     regAlloc.run(_built, intervals, outputs.values);
   }
 }

@@ -1,8 +1,7 @@
 import 'dart:async';
 
 import 'package:rohd/rohd.dart';
-import 'package:rohd_hcl/rohd_hcl.dart';
-import 'package:riscv/riscv.dart';
+import 'package:rohd_hcl/rohd_hcl.dart' hide DataPortInterface, DataPortGroup;
 import 'package:river/river.dart';
 import 'package:river_hdl/river_hdl.dart';
 import 'package:test/test.dart';
@@ -10,8 +9,8 @@ import 'package:test/test.dart';
 Future<void> execTest(
   int instr,
   Map<Register, int> regStates,
-  Microcode microcode,
-  Mxlen mxlen, {
+  MicrocodeRom microcode,
+  RiscVMxlen mxlen, {
   Map<int, int> memStates = const {},
   Map<CsrAddress, int> csrStates = const {},
   Map<int, int> initMem = const {},
@@ -64,11 +63,12 @@ Future<void> execTest(
         LogicValue.filled(dataWidth, LogicValue.zero),
   );
 
+  // ignore: unused_local_variable
   final mem = MemoryModel(
     clk,
     reset,
-    [backingMemWrite],
-    [memRead, backingMemRead],
+    [wrapWriteForRegisterFile(backingMemWrite)],
+    [wrapReadForRegisterFile(memRead), wrapReadForRegisterFile(backingMemRead)],
     readLatency: memLatency,
     storage: storage,
   );
@@ -88,8 +88,8 @@ Future<void> execTest(
   final regs = RegisterFile(
     clk,
     reset,
-    [rdWrite],
-    [rs1Read, rs2Read],
+    [wrapWriteForRegisterFile(rdWrite)],
+    [wrapReadForRegisterFile(rs1Read), wrapReadForRegisterFile(rs2Read)],
     numEntries: 32,
   );
 
@@ -102,7 +102,7 @@ Future<void> execTest(
     clk,
     reset,
     [],
-    [microcodeRead],
+    [wrapReadForRegisterFile(microcodeRead)],
     numEntries: microcode.encodedMops(mxlen).length,
     resetValue: microcode.encodedMops(mxlen),
   );
@@ -166,13 +166,6 @@ Future<void> execTest(
   Simulator.registerAction(15, () {
     reset.put(0);
 
-    for (final regState in initRegisters.entries) {
-      regs.setData(
-        LogicValue.ofInt(regState.key.value, 5),
-        LogicValue.ofInt(regState.value, mxlen.size),
-      );
-    }
-
     for (final memState in initMem.entries) {
       storage.setData(
         LogicValue.ofInt(memState.key, mxlen.size),
@@ -186,10 +179,9 @@ Future<void> execTest(
         LogicValue.ofInt(csrState.value, mxlen.size),
       );
     }
-
-    enable.inject(1);
   });
 
+  Simulator.setMaxSimTime(10000);
   unawaited(Simulator.run());
 
   await clk.nextPosedge;
@@ -198,6 +190,18 @@ Future<void> execTest(
     await clk.nextPosedge;
   }
 
+  // Write initial register values one per cycle
+  for (final regState in initRegisters.entries) {
+    rdWrite.en.inject(1);
+    rdWrite.addr.inject(LogicValue.ofInt(regState.key.value, 5));
+    rdWrite.data.inject(LogicValue.ofInt(regState.value, mxlen.size));
+    await clk.nextPosedge;
+  }
+
+  // Disable register write port after init
+  rdWrite.en.inject(0);
+  await clk.nextPosedge;
+
   for (final csrState in initCsrs.entries) {
     csrs
         .getBackdoor(LogicValue.ofInt(csrState.key.address, 12))
@@ -205,15 +209,14 @@ Future<void> execTest(
         .inject(0);
   }
 
-  while (!exec.done.value.toBool()) {
-    await clk.nextPosedge;
-  }
+  // Enable execution
+  enable.inject(1);
 
-  while (exec.nextPc.value.toInt() != nextPc) {
+  for (var i = 0; i < 100; i++) {
     await clk.nextPosedge;
+    final d = exec.done.value;
+    if (d.isValid && d.toBool()) break;
   }
-
-  await clk.nextPosedge;
 
   await Simulator.endSimulation();
   await Simulator.simulationEnded;
@@ -251,7 +254,10 @@ void main() {
 
   void define(bool isDynamic) {
     group('RV32I', () {
-      final microcode = Microcode(Microcode.buildDecodeMap([rv32i]));
+      final microcode = MicrocodeRom(
+        RiscVIsaConfig(mxlen: RiscVMxlen.rv32, extensions: [rv32i]),
+        encodings: kMicroOpTable,
+      );
 
       test(
         'addi increments register',
@@ -259,7 +265,7 @@ void main() {
           0x00a08293,
           {Register.x5: 10},
           microcode,
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           isDynamic: isDynamic,
         ),
       );
@@ -270,7 +276,7 @@ void main() {
           0x005303B3,
           {Register.x7: 16},
           microcode,
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           initRegisters: {Register.x5: 7, Register.x6: 9},
           isDynamic: isDynamic,
         ),
@@ -282,7 +288,7 @@ void main() {
           0x0042A303,
           {Register.x6: 0xDEADBEEF},
           microcode,
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           initRegisters: {Register.x5: 0x20},
           initMem: {0x24: 0xDEADBEEF},
           isDynamic: isDynamic,
@@ -295,7 +301,7 @@ void main() {
           0x0062A223,
           {},
           microcode,
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           initRegisters: {Register.x5: 0x20, Register.x6: 0xDEADBEEF},
           initMem: {},
           isDynamic: isDynamic,
@@ -308,7 +314,7 @@ void main() {
           0x00628463,
           {},
           microcode,
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           initRegisters: {Register.x5: 5, Register.x6: 5},
           nextPc: 8,
           isDynamic: isDynamic,
@@ -321,7 +327,7 @@ void main() {
           0x00628463,
           {},
           microcode,
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           initRegisters: {Register.x5: 5, Register.x6: 7},
           nextPc: 4,
           isDynamic: isDynamic,
@@ -334,7 +340,7 @@ void main() {
           0x123452B7,
           {Register.x5: 0x12345000},
           microcode,
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           isDynamic: isDynamic,
         ),
       );
@@ -345,7 +351,7 @@ void main() {
           0x100002EF,
           {Register.x5: 4},
           microcode,
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           nextPc: 0x100,
           isDynamic: isDynamic,
         ),
@@ -357,7 +363,7 @@ void main() {
           0x00010297,
           {Register.x5: 0x10000},
           microcode,
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           isDynamic: isDynamic,
         ),
       );
@@ -368,7 +374,7 @@ void main() {
           0x00A22293,
           {Register.x5: 1},
           microcode,
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           initRegisters: {Register.x4: 5},
           isDynamic: isDynamic,
         ),
@@ -376,7 +382,9 @@ void main() {
     });
 
     group('Zicsr', () {
-      final microcode = Microcode(Microcode.buildDecodeMap([rv32i, rv32Zicsr]));
+      final microcode = MicrocodeRom(
+        RiscVIsaConfig(mxlen: RiscVMxlen.rv32, extensions: [rv32i, rvZicsr]),
+      );
 
       test(
         'csrrw: atomic swap (rd=old, CSR=new)',
@@ -384,7 +392,7 @@ void main() {
           0x34029373,
           {Register.x6: 0xAAAA},
           microcode,
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           initRegisters: {Register.x5: 0x1234},
           initCsrs: {CsrAddress.mscratch: 0xAAAA},
           csrStates: {CsrAddress.mscratch: 0x1234},
@@ -398,7 +406,7 @@ void main() {
           0x34029073,
           {Register.x0: 0},
           microcode,
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           initRegisters: {Register.x5: 0x2222},
           initCsrs: {CsrAddress.mscratch: 0x1111},
           csrStates: {CsrAddress.mscratch: 0x2222},
@@ -412,7 +420,7 @@ void main() {
           0x3402A373,
           {Register.x6: 0x100},
           microcode,
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           initRegisters: {Register.x5: 0x0F},
           initCsrs: {CsrAddress.mscratch: 0x100},
           csrStates: {CsrAddress.mscratch: 0x10F},
@@ -426,7 +434,7 @@ void main() {
           0x3400A073,
           {},
           microcode,
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           initCsrs: {CsrAddress.mscratch: 0xABCDE},
           csrStates: {CsrAddress.mscratch: 0xABCDE},
           isDynamic: isDynamic,
@@ -439,7 +447,7 @@ void main() {
           0x3402B373,
           {Register.x6: 0xFF},
           microcode,
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           initRegisters: {Register.x5: 0x0F},
           initCsrs: {CsrAddress.mscratch: 0xFF},
           csrStates: {CsrAddress.mscratch: 0xF0},
@@ -453,7 +461,7 @@ void main() {
           0x3402D373,
           {Register.x6: 0x7777},
           microcode,
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           initCsrs: {CsrAddress.mscratch: 0x7777},
           csrStates: {CsrAddress.mscratch: 5},
           isDynamic: isDynamic,
@@ -466,7 +474,7 @@ void main() {
           0x3401E073,
           {},
           microcode,
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           initCsrs: {CsrAddress.mscratch: 0x10},
           csrStates: {CsrAddress.mscratch: 0x13},
           isDynamic: isDynamic,
@@ -479,7 +487,7 @@ void main() {
           0x3401F073,
           {},
           microcode,
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           initCsrs: {CsrAddress.mscratch: 0xF},
           csrStates: {CsrAddress.mscratch: 0xC},
           isDynamic: isDynamic,

@@ -1,8 +1,7 @@
 import 'dart:async';
 
 import 'package:rohd/rohd.dart';
-import 'package:rohd_hcl/rohd_hcl.dart';
-import 'package:riscv/riscv.dart';
+import 'package:rohd_hcl/rohd_hcl.dart' hide DataPortInterface, DataPortGroup;
 import 'package:river/river.dart';
 import 'package:river_hdl/river_hdl.dart';
 import 'package:test/test.dart';
@@ -10,8 +9,8 @@ import 'package:test/test.dart';
 Future<void> pipelineTest(
   int instr,
   Map<Register, int> regStates,
-  Microcode microcode,
-  Mxlen mxlen, {
+  MicrocodeRom microcode,
+  RiscVMxlen mxlen, {
   Map<Register, int> initRegisters = const {},
   int maxSimTime = 800,
   int cycleCount = 8,
@@ -44,11 +43,15 @@ Future<void> pipelineTest(
   final rs2Read = DataPortInterface(mxlen.size, 5);
   final rdWrite = DataPortInterface(mxlen.size, 5);
 
+  // ignore: unused_local_variable
   final mem = MemoryModel(
     clk,
     reset,
     [],
-    [memFetchRead, memExecRead],
+    [
+      wrapReadForRegisterFile(memFetchRead),
+      wrapReadForRegisterFile(memExecRead),
+    ],
     readLatency: latency,
     storage: SparseMemoryStorage(
       addrWidth: mxlen.size,
@@ -62,8 +65,8 @@ Future<void> pipelineTest(
   final regs = RegisterFile(
     clk,
     reset,
-    [rdWrite],
-    [rs1Read, rs2Read],
+    [wrapWriteForRegisterFile(rdWrite)],
+    [wrapReadForRegisterFile(rs1Read), wrapReadForRegisterFile(rs2Read)],
     numEntries: 32,
   );
 
@@ -95,29 +98,38 @@ Future<void> pipelineTest(
   await pipeline.build();
 
   reset.inject(1);
+  enable.inject(0);
 
-  Simulator.registerAction(20, () {
-    reset.put(0);
-
-    for (final regState in initRegisters.entries) {
-      regs.setData(
-        LogicValue.ofInt(regState.key.value, 5),
-        LogicValue.ofInt(regState.value, mxlen.size),
-      );
-    }
-
-    enable.put(1);
-  });
-
-  Simulator.setMaxSimTime(maxSimTime * ((latency ~/ 36) + 1));
+  Simulator.setMaxSimTime(2000 + maxSimTime * ((latency ~/ 36) + 1));
   unawaited(Simulator.run());
 
-  for (var i = 0; i < cycleCount; i++) {
+  // Release reset
+  await clk.nextPosedge;
+  reset.put(0);
+
+  // Write initial register values one per cycle
+  for (final regState in initRegisters.entries) {
+    rdWrite.en.inject(1);
+    rdWrite.addr.inject(LogicValue.ofInt(regState.key.value, 5));
+    rdWrite.data.inject(LogicValue.ofInt(regState.value, mxlen.size));
     await clk.nextPosedge;
   }
+  rdWrite.en.inject(0);
 
+  // Enable pipeline
+  enable.put(1);
+
+  // Wait for pipeline done
+  for (var i = 0; i < 100; i++) {
+    await clk.nextPosedge;
+    final d = pipeline.done.value;
+    if (d.isValid && d.toBool()) break;
+  }
+
+  await Simulator.endSimulation();
   await Simulator.simulationEnded;
 
+  expect(pipeline.done.value.isValid, isTrue);
   expect(pipeline.done.value.toBool(), isTrue);
   expect(pipeline.nextPc.value.toInt(), nextPc);
 
@@ -135,7 +147,9 @@ void main() {
   });
 
   group('RV32I', () {
-    final microcode = Microcode(Microcode.buildDecodeMap([rv32i]));
+    final microcode = MicrocodeRom(
+      RiscVIsaConfig(mxlen: RiscVMxlen.rv32, extensions: [rv32i]),
+    );
 
     test(
       'addi increments register',
@@ -143,7 +157,7 @@ void main() {
         0x00a08293,
         {Register.x5: 10},
         microcode,
-        Mxlen.mxlen_32,
+        RiscVMxlen.rv32,
       ),
     );
 
@@ -153,7 +167,7 @@ void main() {
         0x005303B3,
         {Register.x7: 16},
         microcode,
-        Mxlen.mxlen_32,
+        RiscVMxlen.rv32,
         initRegisters: {Register.x5: 7, Register.x6: 9},
         maxSimTime: 800,
       ),
@@ -165,7 +179,7 @@ void main() {
         0x00628463,
         {},
         microcode,
-        Mxlen.mxlen_32,
+        RiscVMxlen.rv32,
         initRegisters: {Register.x5: 5, Register.x6: 5},
         nextPc: 8,
         maxSimTime: 800,
@@ -178,7 +192,7 @@ void main() {
         0x00628463,
         {},
         microcode,
-        Mxlen.mxlen_32,
+        RiscVMxlen.rv32,
         initRegisters: {Register.x5: 5, Register.x6: 7},
         nextPc: 4,
         maxSimTime: 800,
@@ -191,7 +205,7 @@ void main() {
         0x100002EF,
         {Register.x5: 4},
         microcode,
-        Mxlen.mxlen_32,
+        RiscVMxlen.rv32,
         nextPc: 0x100,
         maxSimTime: 800,
       ),
@@ -203,7 +217,7 @@ void main() {
         0x00010297,
         {Register.x5: 0x10000},
         microcode,
-        Mxlen.mxlen_32,
+        RiscVMxlen.rv32,
         maxSimTime: 800,
       ),
     );
@@ -214,7 +228,7 @@ void main() {
         0x00A22293,
         {Register.x5: 1},
         microcode,
-        Mxlen.mxlen_32,
+        RiscVMxlen.rv32,
         initRegisters: {Register.x4: 5},
         maxSimTime: 800,
       ),

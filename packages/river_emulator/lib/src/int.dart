@@ -1,7 +1,7 @@
-import 'package:river/river.dart';
+import 'package:river/river.dart' as river;
 
-class InterruptControllerEmulator {
-  final InterruptController config;
+class InterruptController {
+  final river.InterruptController config;
 
   final Map<int, bool> _pending = {};
   final Map<int, int> _priority = {};
@@ -10,7 +10,7 @@ class InterruptControllerEmulator {
   final Map<int, String> _targetByIrq = {};
   final Map<int, String> _sourceByIrq = {};
 
-  InterruptControllerEmulator(this.config) {
+  InterruptController(this.config) {
     for (final line in config.lines) {
       final irq = line.irq;
       _pending[irq] = false;
@@ -179,6 +179,5 @@ class InterruptControllerEmulator {
   }
 
   @override
-  String toString() =>
-      'InterruptControllerEmulator(config: $config, pending: $irqs)';
+  String toString() => 'InterruptController(config: $config, pending: $irqs)';
 }

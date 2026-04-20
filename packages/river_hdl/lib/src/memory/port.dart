@@ -1,5 +1,5 @@
 import 'package:rohd/rohd.dart';
-import 'package:rohd_hcl/rohd_hcl.dart';
+import '../data_port.dart';
 
 /// A sized prefix data port writer to multiple output data ports.
 ///
@@ -48,10 +48,10 @@ class SizedWriteMultiDataPort extends Module {
       );
 
     if (backingWriteDword != null) {
-      backingWriteDword = backingWriteDword!.clone()
+      backingWriteDword = backingWriteDword.clone()
         ..connectIO(
           this,
-          backingWriteDword!,
+          backingWriteDword,
           outputTags: {DataPortGroup.control, DataPortGroup.data},
           inputTags: {DataPortGroup.integrity},
           uniquify: (og) => 'backingWriteDword_$og',
@@ -81,8 +81,8 @@ class SizedWriteMultiDataPort extends Module {
           backingWriteWord.addr < 0,
 
           if (backingWriteDword != null) ...[
-            backingWriteDword!.en < 0,
-            backingWriteDword!.addr < 0,
+            backingWriteDword.en < 0,
+            backingWriteDword.addr < 0,
           ],
         ],
         orElse: [
@@ -115,11 +115,11 @@ class SizedWriteMultiDataPort extends Module {
                   ]),
                   if (backingWriteDword != null)
                     CaseItem(Const(64, width: 7), [
-                      backingWriteDword!.en < 1,
-                      backingWriteDword!.addr < source.addr,
-                      backingWriteDword!.data < source.data.slice(70, 7),
-                      source.done < backingWriteDword!.done,
-                      source.valid < backingWriteDword!.valid,
+                      backingWriteDword.en < 1,
+                      backingWriteDword.addr < source.addr,
+                      backingWriteDword.data < source.data.slice(70, 7),
+                      source.done < backingWriteDword.done,
+                      source.valid < backingWriteDword.valid,
                     ]),
                 ],
                 defaultItem: [
@@ -133,8 +133,8 @@ class SizedWriteMultiDataPort extends Module {
                   backingWriteWord.addr < 0,
 
                   if (backingWriteDword != null) ...[
-                    backingWriteDword!.en < 0,
-                    backingWriteDword!.addr < 0,
+                    backingWriteDword.en < 0,
+                    backingWriteDword.addr < 0,
                   ],
                 ],
               ),
@@ -150,8 +150,8 @@ class SizedWriteMultiDataPort extends Module {
               backingWriteWord.addr < 0,
 
               if (backingWriteDword != null) ...[
-                backingWriteDword!.en < 0,
-                backingWriteDword!.addr < 0,
+                backingWriteDword.en < 0,
+                backingWriteDword.addr < 0,
               ],
             ],
           ),

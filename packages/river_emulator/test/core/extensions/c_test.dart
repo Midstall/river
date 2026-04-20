@@ -1,4 +1,3 @@
-import 'package:riscv/riscv.dart';
 import 'package:river/river.dart';
 import 'package:river_emulator/river_emulator.dart';
 import 'package:test/test.dart';
@@ -9,39 +8,29 @@ void main() {
   cpuTests(
     'C extension',
     (config) {
-      late SramEmulator sram;
-      late RiverCoreEmulator core;
+      late Sram sram;
+      late RiverCore core;
       late int pc;
 
       setUp(() {
-        sram = SramEmulator(
-          Device.simple(
+        sram = Sram(
+          RiverDevice(
             name: 'sram',
             compatible: 'river,sram',
             range: BusAddressRange(0, 0xFFFF),
-            fields: const {0: DeviceField('data', 4)},
-            clock: config.clock,
+            clockFrequency:
+                (config.clock.rate as HarborFixedClockRate).frequency,
           ),
         );
 
-        core = RiverCoreEmulator(
-          config,
-          memDevices: Map.fromEntries([sram.mem!]),
-        );
+        core = RiverCore(config, memDevices: Map.fromEntries([sram.mem!]));
         pc = config.resetVector;
       });
 
       Future<void> writeWord(int addr, int value) =>
-          core.mmu.write(addr, value, MicroOpMemSize.word.bytes);
+          core.mmu.write(addr, value, 4);
 
-      Future<int> readWord(int addr) =>
-          core.mmu.read(addr, MicroOpMemSize.word.bytes);
-
-      Future<void> writeDword(int addr, int value) =>
-          core.mmu.write(addr, value, MicroOpMemSize.dword.bytes);
-
-      Future<int> readDword(int addr) =>
-          core.mmu.read(addr, MicroOpMemSize.dword.bytes);
+      Future<int> readWord(int addr) => core.mmu.read(addr, 4);
 
       test('c.addi4spn expands to addi rd, x2, nzuimm', () async {
         core.xregs[Register.x2] = 0x1000;

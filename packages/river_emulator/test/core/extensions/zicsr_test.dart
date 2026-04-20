@@ -1,4 +1,3 @@
-import 'package:riscv/riscv.dart';
 import 'package:river/river.dart';
 import 'package:river_emulator/river_emulator.dart';
 import 'package:test/test.dart';
@@ -9,25 +8,22 @@ void main() {
   cpuTests(
     'Zicsr extension',
     (config) {
-      late SramEmulator sram;
-      late RiverCoreEmulator core;
+      late Sram sram;
+      late RiverCore core;
       late int pc;
 
       setUp(() {
-        sram = SramEmulator(
-          Device.simple(
+        sram = Sram(
+          RiverDevice(
             name: 'sram',
             compatible: 'river,sram',
             range: BusAddressRange(0, 0xFFFF),
-            fields: const {0: DeviceField('data', 4)},
-            clock: config.clock,
+            clockFrequency:
+                (config.clock.rate as HarborFixedClockRate).frequency,
           ),
         );
 
-        core = RiverCoreEmulator(
-          config,
-          memDevices: Map.fromEntries([sram.mem!]),
-        );
+        core = RiverCore(config, memDevices: Map.fromEntries([sram.mem!]));
         pc = config.resetVector;
       });
 
@@ -144,6 +140,69 @@ void main() {
       test("Writing to read-only CSR (misa) traps", () {
         final instr =
             (CsrAddress.misa.address << 20) | (2 << 15) | (1 << 7) | 0x1073;
+        expect(() => core.cycle(pc, instr), throwsA(isA<TrapException>()));
+      });
+
+      test("rpipelinectl resets to 0", () {
+        expect(read(CsrAddress.rpipelinectl), 0);
+      });
+
+      test("rpipelinectl is WARL: only bits [3:0] are writable", () {
+        write(CsrAddress.rpipelinectl, 0xFFFF);
+        expect(read(CsrAddress.rpipelinectl), 0xF);
+        write(CsrAddress.rpipelinectl, 0x5);
+        expect(read(CsrAddress.rpipelinectl), 0x5);
+      });
+
+      test("rpipelinectl SSBD bit round-trips via csrrw", () async {
+        // csrrw x6, rpipelinectl, x5 with x5 = 1 (SSBD set)
+        core.xregs[Register.x5] = 0x1;
+        final csrrw =
+            (CsrAddress.rpipelinectl.address << 20) |
+            (5 << 15) |
+            (6 << 7) |
+            0x1073;
+        await core.cycle(pc, csrrw);
+        expect(read(CsrAddress.rpipelinectl) & 0x1, 0x1);
+      });
+
+      test("User-mode writing rpipelinectl traps", () {
+        core.mode = PrivilegeMode.user;
+        final instr =
+            (CsrAddress.rpipelinectl.address << 20) |
+            (2 << 15) |
+            (1 << 7) |
+            0x1073;
+        expect(() => core.cycle(pc, instr), throwsA(isA<TrapException>()));
+      });
+
+      test("rpipelinecap reads the config feature bitmap", () {
+        expect(read(CsrAddress.rpipelinecap), config.rpipelineCap);
+      });
+
+      test("rpipelinecap read via csrrs instruction does not trap", () async {
+        // csrrs x3, rpipelinecap, x0 (rs1=x0 -> pure read, no write attempt)
+        final instr =
+            (CsrAddress.rpipelinecap.address << 20) |
+            (0 << 15) |
+            (2 << 12) |
+            (3 << 7) |
+            0x73;
+        final newPc = await core.cycle(pc, instr);
+        expect(core.xregs[Register.x3], config.rpipelineCap);
+        expect(newPc, pc + 4);
+      });
+
+      test("rpipelinecap is read-only: writing traps", () {
+        // Write a value distinct from the cap so the emulator's no-op-write
+        // skip (core.dart) doesn't elide the write before the RO trap fires.
+        core.xregs[Register.x1] = 0xFF;
+        // csrrw x2, rpipelinecap, x1
+        final instr =
+            (CsrAddress.rpipelinecap.address << 20) |
+            (1 << 15) |
+            (2 << 7) |
+            0x1073;
         expect(() => core.cycle(pc, instr), throwsA(isA<TrapException>()));
       });
     },

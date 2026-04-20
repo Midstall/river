@@ -1,30 +1,28 @@
 import 'dart:io';
-import 'dart:convert';
 
-import 'package:riscv/riscv.dart';
 import 'package:river/river.dart';
 import '../core.dart';
 import '../dev.dart';
 import '../soc.dart';
 
-class FlashEmulator extends DeviceEmulator {
+class Flash extends Device {
   final List<int> data;
   bool enabled;
 
-  FlashEmulator(super.config, this.data) : enabled = true;
+  Flash(super.config, this.data) : enabled = true;
 
   @override
-  DeviceAccessorEmulator? get memAccessor => FlashAccessorEmulator(this);
+  DeviceAccessor? get memAccessor => FlashAccessor(this);
 
   @override
-  String toString() => 'FlashEmulator(config: $config)';
+  String toString() => 'Flash(config: $config)';
 
-  static DeviceEmulator create(
-    Device config,
+  static Device create(
+    RiverDevice config,
     Map<String, String> options,
-    RiverSoCEmulator _soc,
+    RiverSoC soc,
   ) {
-    var data = List.filled(config.mmap!.size, 0);
+    var data = List.filled(config.range!.size, 0);
 
     if (options.containsKey('file')) {
       data = File(options['file']!).readAsBytesSync();
@@ -37,18 +35,18 @@ class FlashEmulator extends DeviceEmulator {
           .toList();
     }
 
-    if (data.length < config.mmap!.size) {
-      data = [...data, ...List.filled(config.mmap!.size - data.length, 0)];
+    if (data.length < config.range!.size) {
+      data = [...data, ...List.filled(config.range!.size - data.length, 0)];
     }
 
-    return FlashEmulator(config, data);
+    return Flash(config, data);
   }
 }
 
-class FlashAccessorEmulator extends DeviceAccessorEmulator {
-  final FlashEmulator rom;
+class FlashAccessor extends DeviceAccessor {
+  final Flash rom;
 
-  FlashAccessorEmulator(this.rom) : super(rom.config.accessor!);
+  FlashAccessor(this.rom);
 
   @override
   Future<int> read(int addr, int width) {

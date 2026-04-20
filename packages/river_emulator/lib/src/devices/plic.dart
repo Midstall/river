@@ -4,7 +4,7 @@ import 'package:river/river.dart';
 import '../dev.dart';
 import '../soc.dart';
 
-class RiscVPlicEmulator extends DeviceEmulator {
+class Plic extends Device {
   final int numSources;
   final List<int> _priority;
   final Map<int, int> _enable = {};
@@ -12,7 +12,7 @@ class RiscVPlicEmulator extends DeviceEmulator {
 
   int _pending = 0;
 
-  RiscVPlicEmulator(super.config, {this.numSources = 32})
+  Plic(super.config, {this.numSources = 32})
     : _priority = List<int>.filled(33, 1);
 
   void setPriority(int i, int value) {
@@ -54,8 +54,8 @@ class RiscVPlicEmulator extends DeviceEmulator {
   }
 
   @override
-  Map<int, bool> interrupts(int hartId) {
-    final best = _findBest(hartId);
+  Map<int, bool> interrupts(int hart) {
+    final best = _findBest(hart);
     return {0: best != 0};
   }
 
@@ -72,83 +72,82 @@ class RiscVPlicEmulator extends DeviceEmulator {
 
   @override
   void reset() {
-    for (int i = 0; i < _priority.length; i++) _priority[i] = 1;
+    for (int i = 0; i < _priority.length; i++) {
+      _priority[i] = 1;
+    }
     _pending = 0;
     _enable.clear();
     _threshold.clear();
   }
 
   @override
-  DeviceAccessorEmulator? get memAccessor => RiscVPlicAccessorEmulator(this);
+  DeviceAccessor? get memAccessor => PlicAccessor(this);
 
-  static DeviceEmulator create(
-    Device config,
+  static Device create(
+    RiverDevice config,
     Map<String, String> options,
-    RiverSoCEmulator _soc,
+    RiverSoC soc,
   ) {
     final sources = int.tryParse(options['sources'] ?? '') ?? 32;
-    return RiscVPlicEmulator(config, numSources: sources);
+    return Plic(config, numSources: sources);
   }
 }
 
-class RiscVPlicAccessorEmulator
-    extends DeviceFieldAccessorEmulator<RiscVPlicEmulator> {
-  RiscVPlicAccessorEmulator(super.device);
+class PlicAccessor extends DeviceAccessor {
+  final Plic device;
 
-  int _parseHart(String name) {
-    final match = RegExp(r'cpu(\d+)').firstMatch(name);
-    if (match == null) return 0;
-    return int.parse(match.group(1)!);
-  }
+  PlicAccessor(this.device) : super(type: DeviceAccessorType.io);
 
   @override
-  Future<int> readPath(String name) async {
-    if (name == 'priority') return device._priority[1];
-    if (name == 'pending') return device._pending;
-
-    if (name.startsWith('enable_cpu')) {
-      final hart = _parseHart(name);
+  Future<int> read(int addr, int width) async {
+    // PLIC register map:
+    // 0x000000-0x000FFF: source priorities (4 bytes each)
+    // 0x001000-0x00107F: pending bits
+    // 0x002000-0x0020FF: enable bits for context 0
+    // 0x200000: threshold for context 0
+    // 0x200004: claim/complete for context 0
+    if (addr >= 0x000000 && addr < 0x001000) {
+      final source = addr ~/ 4;
+      if (source > 0 && source <= device.numSources) {
+        return device._priority[source];
+      }
+    } else if (addr >= 0x001000 && addr < 0x001080) {
+      return device._pending;
+    } else if (addr >= 0x002000 && addr < 0x002100) {
+      final hart = (addr - 0x002000) ~/ 0x80;
       return device._enable[hart] ?? 0;
+    } else if (addr >= 0x200000 && addr < 0x400000) {
+      final context = (addr - 0x200000) ~/ 0x1000;
+      final offset = (addr - 0x200000) % 0x1000;
+      if (offset == 0) {
+        return device._threshold[context] ?? 0;
+      } else if (offset == 4) {
+        return device.claim(context);
+      }
     }
-
-    if (name.startsWith('threshold_cpu')) {
-      final hart = _parseHart(name);
-      return device._threshold[hart] ?? 0;
-    }
-
-    if (name.startsWith('claim_cpu')) {
-      final hart = _parseHart(name);
-      return device.claim(hart);
-    }
-
     return 0;
   }
 
   @override
-  Future<void> writePath(String name, int value) async {
+  Future<void> write(int addr, int value, int width) async {
     value &= 0xFFFFFFFF;
 
-    if (name == 'priority') {
-      device._priority[1] = value & 0x7;
-      return;
-    }
-
-    if (name.startsWith('enable_cpu')) {
-      final hart = _parseHart(name);
+    if (addr >= 0x000000 && addr < 0x001000) {
+      final source = addr ~/ 4;
+      if (source > 0 && source <= device.numSources) {
+        device._priority[source] = value & 0x7;
+      }
+    } else if (addr >= 0x002000 && addr < 0x002100) {
+      final hart = (addr - 0x002000) ~/ 0x80;
       device._enable[hart] = value;
-      return;
-    }
-
-    if (name.startsWith('threshold_cpu')) {
-      final hart = _parseHart(name);
-      device._threshold[hart] = value & 0x7;
-      return;
-    }
-
-    if (name.startsWith('claim_cpu')) {
-      final hart = _parseHart(name);
-      device.complete(hart, value);
-      return;
+    } else if (addr >= 0x200000 && addr < 0x400000) {
+      final context = (addr - 0x200000) ~/ 0x1000;
+      final offset = (addr - 0x200000) % 0x1000;
+      if (offset == 0) {
+        device._threshold[context] = value & 0x7;
+      } else if (offset == 4) {
+        device.complete(context, value);
+      }
     }
   }
 }

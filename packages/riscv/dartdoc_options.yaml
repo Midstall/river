@@ -1,9 +1,0 @@
-dartdoc:
-  categories:
-    extensions:
-      displayName: Extensions
-      markdown: doc/extensions.md
-    microcode:
-      displayName: Microcode
-      markdown: doc/microcode.md
-  showUndocumentedCategories: true

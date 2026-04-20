@@ -2,15 +2,22 @@ name: river_workspace
 publish_to: none
 
 environment:
-  sdk: ^3.9.3
+  sdk: ^3.11.2
 
 workspace:
   - packages/bintools
-  - packages/riscv
   - packages/river
   - packages/river_adl
   - packages/river_emulator
   - packages/river_hdl
+  - packages/river_maskrom
+
+dependency_overrides:
+  harbor:
+    git:
+      url: https://github.com/MidstallSoftware/harbor.git
+      path: packages/harbor
+      ref: master
 
 dev_dependencies:
   coverage: ^1.15.0

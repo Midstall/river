@@ -150,6 +150,17 @@
       "source": "hosted",
       "version": "2.1.3"
     },
+    "harbor": {
+      "dependency": "direct overridden",
+      "description": {
+        "path": "packages/harbor",
+        "ref": "master",
+        "resolved-ref": "4f4352e654e735ae1d117d9087b7fa72583d8dea",
+        "url": "https://github.com/MidstallSoftware/harbor.git"
+      },
+      "source": "git",
+      "version": "0.0.1"
+    },
     "html": {
       "dependency": "transitive",
       "description": {
@@ -314,21 +325,20 @@
       "dependency": "transitive",
       "description": {
         "name": "rohd_bridge",
-        "sha256": "541577b8af73f1f1a5965f4646b7cff2552727a01d42a87246ec51f94c7351e7",
+        "sha256": "40a8a7e4166186622a83f4b486c244601f3903dca4fd8e3c2caff175919cbe7a",
         "url": "https://pub.dev"
       },
       "source": "hosted",
-      "version": "0.2.1"
+      "version": "0.2.2"
     },
     "rohd_hcl": {
       "dependency": "transitive",
       "description": {
-        "path": ".",
-        "ref": "integration",
-        "resolved-ref": "a5cde623e091724be491cfa4f61dca8b99cb0daa",
-        "url": "https://github.com/MidstallSoftware/rohd-hcl.git"
+        "name": "rohd_hcl",
+        "sha256": "2f97380982453f491a1eafb5349046e7f679a937825fcee7f42bdc7c2df1b8df",
+        "url": "https://pub.dev"
       },
-      "source": "git",
+      "source": "hosted",
       "version": "0.2.1"
     },
     "rohd_vf": {
@@ -563,6 +573,6 @@
     }
   },
   "sdks": {
-    "dart": ">=3.9.4 <4.0.0"
+    "dart": ">=3.11.2 <4.0.0"
   }
 }

@@ -1,17 +1,17 @@
 import 'dart:async';
 
 import 'package:rohd/rohd.dart';
-import 'package:rohd_hcl/rohd_hcl.dart';
-import 'package:riscv/riscv.dart';
+import 'package:rohd_hcl/rohd_hcl.dart' hide DataPortInterface, DataPortGroup;
+import 'package:harbor/harbor.dart';
 import 'package:river/river.dart';
 import 'package:river_hdl/river_hdl.dart';
 import 'package:test/test.dart';
 
-Future<void> decoderTest<T extends InstructionType>(
+Future<void> decoderTest(
   int instr,
   Map<String, int> fields,
-  Mxlen mxlen,
-  Microcode microcode, {
+  RiscVMxlen mxlen,
+  MicrocodeRom microcode, {
   bool isDynamic = false,
 }) async {
   final clk = SimpleClockGenerator(20).clk;
@@ -29,7 +29,7 @@ Future<void> decoderTest<T extends InstructionType>(
     clk,
     reset,
     [],
-    [microcodeRead],
+    [wrapReadForRegisterFile(microcodeRead)],
     numEntries: microcode.map.length,
     resetValue: microcode.encodedPatterns,
   );
@@ -55,8 +55,6 @@ Future<void> decoderTest<T extends InstructionType>(
 
   await decoder.build();
 
-  WaveDumper(decoder);
-
   reset.inject(1);
   enable.inject(0);
 
@@ -73,28 +71,27 @@ Future<void> decoderTest<T extends InstructionType>(
     await clk.nextPosedge;
   }
 
-  while (!decoder.done.value.toBool()) {
+  while (true) {
+    final d = decoder.done.value;
+    if (d.isValid && d.toBool()) break;
     await clk.nextPosedge;
+  }
+
+  // Capture field values when done is asserted
+  final valid = decoder.valid.value;
+  final fieldValues = <String, LogicValue>{};
+  for (final entry in fields.entries) {
+    final f = decoder.fields[entry.key];
+    if (f != null) fieldValues[entry.key] = f.value;
   }
 
   await Simulator.endSimulation();
   await Simulator.simulationEnded;
 
-  expect(decoder.valid.value.toBool(), isTrue);
-
-  final typeName = T.toString();
-
-  for (final entry in decoder.instrTypeMap.entries) {
-    final value = entry.value.value.toBool();
-    if (entry.key == typeName) {
-      expect(value, isTrue);
-    } else {
-      expect(value, isFalse);
-    }
-  }
+  expect(valid.toBool(), isTrue);
 
   for (final entry in fields.entries) {
-    final value = decoder.fields[entry.key]!.value.toInt();
+    final value = fieldValues[entry.key]!.toInt();
     expect(value, equals(entry.value), reason: '${entry.key}=$value');
   }
 }
@@ -106,10 +103,12 @@ void main() {
 
   void define(bool isDynamic) {
     group('RV32I', () {
-      final microcode = Microcode(Microcode.buildDecodeMap([rv32i]));
+      final microcode = MicrocodeRom(
+        RiscVIsaConfig(mxlen: RiscVMxlen.rv32, extensions: [rv32i]),
+      );
 
       test('R-type: add x3, x1, x2', () async {
-        await decoderTest<RType>(
+        await decoderTest(
           0x002081B3,
           {
             'opcode': 0x33,
@@ -119,27 +118,45 @@ void main() {
             'funct3': 0,
             'funct7': 0,
           },
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           microcode,
           isDynamic: isDynamic,
         );
       });
 
       test('I-type: addi x5, x1, 10', () async {
-        await decoderTest<IType>(
+        await decoderTest(
           0x00A08293,
           {'opcode': 0x13, 'rd': 5, 'rs1': 1, 'imm': 10, 'funct3': 0},
-          Mxlen.mxlen_32,
+          RiscVMxlen.rv32,
           microcode,
           isDynamic: isDynamic,
         );
       });
 
       test('S-type: sw x2, 12(x1)', () async {
-        await decoderTest<SType>(
+        await decoderTest(
           0x0020A623,
-          {'opcode': 0x23, 'rs1': 1, 'rs2': 2, 'funct3': 0x2, 'imm[4:0]': 12},
-          Mxlen.mxlen_32,
+          {'opcode': 0x23, 'rs1': 1, 'rs2': 2, 'funct3': 0x2, 'immLo': 12},
+          RiscVMxlen.rv32,
+          microcode,
+          isDynamic: isDynamic,
+        );
+      });
+
+      // A negative store offset must sign-extend the S-type immediate to full
+      // width. Regression for the zero-extend-then-sign-extend no-op bug.
+      test('S-type sign-extend: sw x2, -4(x1)', () async {
+        await decoderTest(
+          0xFE20AE23,
+          {
+            'opcode': 0x23,
+            'rs1': 1,
+            'rs2': 2,
+            'funct3': 0x2,
+            'imm': 0xFFFFFFFC,
+          },
+          RiscVMxlen.rv32,
           microcode,
           isDynamic: isDynamic,
         );

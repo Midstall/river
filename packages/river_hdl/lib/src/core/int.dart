@@ -54,7 +54,6 @@ class RiscVInterruptController extends Module {
 
   static const int _prioBase = 0x0000;
   static const int _pendBase = 0x1000;
-  static const int _enBase = 0x2000;
   static const int _ctxBase = 0x3000;
 
   static const int _ctxStride = 0x100;

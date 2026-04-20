@@ -1,13 +1,11 @@
-import 'package:riscv/riscv.dart';
 import 'package:river/river.dart';
-import '../core.dart';
 import '../dev.dart';
 import '../soc.dart';
 
-class SramEmulator extends DeviceEmulator {
+class Sram extends Device {
   List<int> data;
 
-  SramEmulator(super.config) : data = List.filled(config.mmap!.size, 0);
+  Sram(super.config) : data = List.filled(config.range!.size, 0);
 
   @override
   void reset() {
@@ -15,22 +13,22 @@ class SramEmulator extends DeviceEmulator {
   }
 
   @override
-  DeviceAccessorEmulator? get memAccessor => SramAccessorEmulator(this);
+  DeviceAccessor? get memAccessor => SramAccessor(this);
 
   @override
-  String toString() => 'SramEmulator(config: $config)';
+  String toString() => 'Sram(config: $config)';
 
-  static DeviceEmulator create(
-    Device config,
-    Map<String, String> _options,
-    RiverSoCEmulator _soc,
-  ) => SramEmulator(config);
+  static Device create(
+    RiverDevice config,
+    Map<String, String> options,
+    RiverSoC soc,
+  ) => Sram(config);
 }
 
-class SramAccessorEmulator extends DeviceAccessorEmulator {
-  final SramEmulator sram;
+class SramAccessor extends DeviceAccessor {
+  final Sram sram;
 
-  SramAccessorEmulator(this.sram) : super(sram.config.accessor!);
+  SramAccessor(this.sram);
 
   @override
   Future<int> read(int addr, int width) {
@@ -46,7 +44,6 @@ class SramAccessorEmulator extends DeviceAccessorEmulator {
   Future<void> write(int addr, int value, int width) async {
     for (int i = 0; i < width; i++) {
       final byte = (value >> (8 * i)) & 0xFF;
-
       sram.data[addr + i] = byte;
     }
   }

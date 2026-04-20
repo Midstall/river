@@ -1,30 +1,23 @@
 import 'dart:async';
-import 'dart:math';
 
 import 'package:river/river.dart';
 
 import '../dev.dart';
 import '../soc.dart';
 
-class RiscVClintEmulator extends DeviceEmulator {
+class Clint extends Device {
   int msip = 0;
-  int _mtimecmp = 0;
+  int mtimecmp = 0;
   int _mtimeBase = 0;
 
   final Stopwatch _stopwatch = Stopwatch();
 
-  RiscVClintEmulator(super.config) {
+  Clint(super.config) {
     _stopwatch.start();
   }
 
-  int get mtimecmp => _mtimecmp;
-
-  set mtimecmp(int value) {
-    _mtimecmp = value;
-  }
-
   int get mtime {
-    final hz = config.clock?.baseFreqHz ?? 0;
+    final hz = config.clockFrequency ?? 0;
     if (hz <= 0) {
       return _mtimeBase + _stopwatch.elapsedMicroseconds;
     }
@@ -46,14 +39,14 @@ class RiscVClintEmulator extends DeviceEmulator {
   bool get timerInterruptPending => mtimecmp != 0 && mtime >= mtimecmp;
 
   @override
-  Map<int, bool> interrupts(int hartId) {
+  Map<int, bool> interrupts(int hart) {
     return {0: softwareInterruptPending, 1: timerInterruptPending};
   }
 
   @override
   void reset() {
     msip = 0;
-    _mtimecmp = 0;
+    mtimecmp = 0;
     _mtimeBase = 0;
     _stopwatch
       ..reset()
@@ -61,46 +54,53 @@ class RiscVClintEmulator extends DeviceEmulator {
   }
 
   @override
-  DeviceAccessorEmulator? get memAccessor => RiscVClintAccessorEmulator(this);
+  DeviceAccessor? get memAccessor => ClintAccessor(this);
 
-  static DeviceEmulator create(
-    Device config,
+  static Device create(
+    RiverDevice config,
     Map<String, String> options,
-    RiverSoCEmulator _soc,
+    RiverSoC soc,
   ) {
-    return RiscVClintEmulator(config);
+    return Clint(config);
   }
 }
 
-class RiscVClintAccessorEmulator
-    extends DeviceFieldAccessorEmulator<RiscVClintEmulator> {
-  RiscVClintAccessorEmulator(super.device);
+class ClintAccessor extends DeviceAccessor {
+  final Clint device;
+
+  ClintAccessor(this.device) : super(type: DeviceAccessorType.io);
 
   @override
-  Future<int> readPath(String name) async {
-    switch (name) {
-      case 'msip':
-        return device.msip & 0xFFFFFFFF;
-      case 'mtimecmp':
-        return device.mtimecmp;
-      case 'mtime':
-        return device.mtime;
+  Future<int> read(int addr, int width) async {
+    // CLINT register map:
+    // 0x0000: msip (4 bytes)
+    // 0x4000: mtimecmp (8 bytes)
+    // 0xBFF8: mtime (8 bytes)
+    if (addr >= 0x0000 && addr < 0x0004) {
+      return device.msip & 0xFFFFFFFF;
+    } else if (addr >= 0x4000 && addr < 0x4008) {
+      final offset = addr - 0x4000;
+      return (device.mtimecmp >> (offset * 8)) & ((1 << (width * 8)) - 1);
+    } else if (addr >= 0xBFF8 && addr < 0xC000) {
+      final offset = addr - 0xBFF8;
+      return (device.mtime >> (offset * 8)) & ((1 << (width * 8)) - 1);
     }
     return 0;
   }
 
   @override
-  Future<void> writePath(String name, int value) async {
-    switch (name) {
-      case 'msip':
-        device.msip = value & 0x1;
-        break;
-      case 'mtimecmp':
-        device.mtimecmp = value;
-        break;
-      case 'mtime':
-        device.mtime = value;
-        break;
+  Future<void> write(int addr, int value, int width) async {
+    if (addr >= 0x0000 && addr < 0x0004) {
+      device.msip = value & 0x1;
+    } else if (addr >= 0x4000 && addr < 0x4008) {
+      final offset = addr - 0x4000;
+      final mask = ((1 << (width * 8)) - 1) << (offset * 8);
+      device.mtimecmp =
+          (device.mtimecmp & ~mask) | ((value << (offset * 8)) & mask);
+    } else if (addr >= 0xBFF8 && addr < 0xC000) {
+      final offset = addr - 0xBFF8;
+      final mask = ((1 << (width * 8)) - 1) << (offset * 8);
+      device.mtime = (device.mtime & ~mask) | ((value << (offset * 8)) & mask);
     }
   }
 }

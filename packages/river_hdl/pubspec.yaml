@@ -5,23 +5,26 @@ resolution: workspace
 # repository: https://github.com/my_org/my_repo
 
 environment:
-  sdk: ^3.9.3
+  sdk: ^3.11.2
 
 # Add regular dependencies here.
 dependencies:
   args: ^2.7.0
+  bintools: ^1.0.0
+  harbor: ^0.0.1
   logging: ^1.3.0
   path: ^1.9.1
-  riscv: ^1.0.0
   river: ^1.0.0
-  rohd: ^0.6.6
-  rohd_bridge: ^0.2.0
-  rohd_hcl:
-    git:
-      url: https://github.com/MidstallSoftware/rohd-hcl.git
-      ref: integration
+  river_adl: ^1.0.0
+  river_maskrom: ^1.0.0
+  rohd: ^0.6.8
+  rohd_bridge: ^0.2.2
+  rohd_hcl: ^0.2.1
 
 dev_dependencies:
   lints: ^6.0.0
   test: ^1.28.0
   dartdoc: ^9.0.0
+  # Differential parity tests run the same program on the emulator (golden) and
+  # the HDL and compare architectural state. No cycle (emulator doesn't dep hdl).
+  river_emulator: ^1.0.0

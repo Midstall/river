@@ -20,3 +20,8 @@ doc/api
 *.out
 *.elf
 *.bin
+
+# Heimdall runtime SQLite databases, created when the daemon/tests run with a
+# working directory inside a package (not part of the source tree)
+*.db
+objects

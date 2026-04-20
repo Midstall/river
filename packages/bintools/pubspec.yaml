@@ -5,7 +5,7 @@ resolution: workspace
 # repository: https://github.com/my_org/my_repo
 
 environment:
-  sdk: ^3.9.4
+  sdk: ^3.11.2
 
 # Add regular dependencies here.
 dependencies:

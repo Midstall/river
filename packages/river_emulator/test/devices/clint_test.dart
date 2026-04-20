@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'package:riscv/riscv.dart';
 import 'package:river/river.dart';
 import 'package:river_emulator/river_emulator.dart';
 import 'package:test/test.dart';
@@ -8,46 +7,44 @@ import '../constants.dart';
 
 void main() {
   cpuTests('CLINT Device', (config) {
-    late SramEmulator sram;
-    late RiscVClintEmulator clint;
-    late RiverCoreEmulator core;
+    late Sram sram;
+    late Clint clint;
+    late RiverCore core;
 
     const clintAddr = 0x2000000;
 
     setUp(() {
       // Simple SRAM backing store
-      sram = SramEmulator(
-        Device.simple(
+      sram = Sram(
+        RiverDevice(
           name: 'sram',
           compatible: 'river,sram',
           range: BusAddressRange(0, 0xFFFF),
-          fields: const {0: DeviceField('data', 4)},
-          clock: config.clock,
+          clockFrequency: (config.clock.rate as HarborFixedClockRate).frequency,
         ),
       );
 
       // CLINT instance
-      clint = RiscVClintEmulator(
-        RiscVClint(name: 'clint', address: clintAddr, clock: config.clock),
+      clint = Clint(
+        RiverDevice(
+          name: 'clint',
+          compatible: 'riscv,clint0',
+          range: BusAddressRange(clintAddr, 0x10000),
+          clockFrequency: (config.clock.rate as HarborFixedClockRate).frequency,
+        ),
       );
 
-      core = RiverCoreEmulator(
+      core = RiverCore(
         config,
         memDevices: Map.fromEntries([sram.mem!, clint.mem!]),
       );
     });
 
-    Future<void> writeWord(int addr, int val) =>
-        core.mmu.write(addr, val, MicroOpMemSize.word.bytes);
+    Future<void> writeWord(int addr, int val) => core.mmu.write(addr, val, 4);
 
-    Future<int> readWord(int addr) =>
-        core.mmu.read(addr, MicroOpMemSize.word.bytes);
+    Future<void> writeDouble(int addr, int val) => core.mmu.write(addr, val, 8);
 
-    Future<void> writeDouble(int addr, int val) =>
-        core.mmu.write(addr, val, MicroOpMemSize.dword.bytes);
-
-    Future<int> readDouble(int addr) =>
-        core.mmu.read(addr, MicroOpMemSize.dword.bytes);
+    Future<int> readDouble(int addr) => core.mmu.read(addr, 8);
 
     // Memory map offsets:
     final msipAddr = clintAddr + 0x0000;
@@ -76,7 +73,7 @@ void main() {
     test('MTIP fires when mtime >= mtimecmp', () async {
       await writeDouble(mtimecmpAddr, 10);
 
-      await Future.delayed(Duration(milliseconds: 5));
+      await Future<void>.delayed(Duration(milliseconds: 5));
 
       expect(clint.interrupts(0)[1], isTrue);
     });
@@ -88,7 +85,7 @@ void main() {
     });
 
     test('Write mtime resets the base (mtime decreases)', () async {
-      await Future.delayed(Duration(milliseconds: 5));
+      await Future<void>.delayed(Duration(milliseconds: 5));
       final before = await readDouble(mtimeAddr);
 
       await writeDouble(mtimeAddr, 5);
@@ -99,7 +96,7 @@ void main() {
 
     test('MTIP clears when mtimecmp is set higher again', () async {
       await writeDouble(mtimecmpAddr, 5);
-      await Future.delayed(Duration(milliseconds: 5));
+      await Future<void>.delayed(Duration(milliseconds: 5));
       expect(clint.interrupts(0)[1], isTrue);
 
       await writeDouble(mtimecmpAddr, 0xFFFFFFFF);
@@ -109,7 +106,7 @@ void main() {
     test('mtime increases over real time', () async {
       final t1 = await readDouble(mtimeAddr);
 
-      await Future.delayed(Duration(milliseconds: 2));
+      await Future<void>.delayed(Duration(milliseconds: 2));
 
       final t2 = await readDouble(mtimeAddr);
 

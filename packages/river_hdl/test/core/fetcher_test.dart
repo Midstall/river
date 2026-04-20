@@ -1,9 +1,7 @@
 import 'dart:async';
 
 import 'package:rohd/rohd.dart';
-import 'package:rohd_hcl/rohd_hcl.dart';
-import 'package:riscv/riscv.dart';
-import 'package:river/river.dart';
+import 'package:rohd_hcl/rohd_hcl.dart' hide DataPortInterface, DataPortGroup;
 import 'package:river_hdl/river_hdl.dart';
 import 'package:test/test.dart';
 
@@ -19,11 +17,12 @@ Future<void> fetcherTest(
 
   final memRead = DataPortInterface(32, 32);
 
+  // ignore: unused_local_variable
   final mem = MemoryModel(
     clk,
     reset,
     [],
-    [memRead],
+    [wrapReadForRegisterFile(memRead, clk: clk, readLatency: latency)],
     readLatency: latency,
     storage: SparseMemoryStorage(
       addrWidth: 32,
@@ -53,6 +52,7 @@ Future<void> fetcherTest(
   reset.inject(1);
   enable.inject(0);
 
+  Simulator.setMaxSimTime(10000 + latency * 50);
   unawaited(Simulator.run());
 
   await clk.nextPosedge;
@@ -63,20 +63,24 @@ Future<void> fetcherTest(
 
   await clk.nextPosedge;
 
-  while (!fetcher.done.value.toBool()) {
+  while (true) {
     await clk.nextPosedge;
+    final d = fetcher.done.value;
+    if (d.isValid && d.toBool()) break;
   }
 
-  await clk.nextPosedge;
+  final resultValue = fetcher.result.value;
+  final doneValue = fetcher.done.value;
+  final compressedValue = hasCompressed ? fetcher.compressed.value : null;
 
   await Simulator.endSimulation();
   await Simulator.simulationEnded;
 
-  expect(fetcher.done.value.toBool(), isTrue);
-  expect(fetcher.result.value.toInt(), instr);
+  expect(doneValue.toBool(), isTrue);
+  expect(resultValue.toInt(), instr);
 
   if (hasCompressed) {
-    expect(fetcher.compressed.value.toBool(), isCompressed);
+    expect(compressedValue!.toBool(), isCompressed);
   }
 }
 
@@ -91,7 +95,11 @@ void main() {
     const latencies = <int>[12, 24, 36, 120, 240, 360, 1200];
 
     for (final latency in latencies) {
-      test('Latency $latency', () => fetcherTest(0x00a08293, latency: latency));
+      test(
+        'Latency $latency',
+        () => fetcherTest(0x00a08293, latency: latency),
+        timeout: Timeout(Duration(seconds: latency ~/ 10 + 30)),
+      );
     }
   });
 
@@ -112,6 +120,7 @@ void main() {
           hasCompressed: true,
           isCompressed: true,
         ),
+        timeout: Timeout(Duration(seconds: latency ~/ 10 + 30)),
       );
     }
   });
