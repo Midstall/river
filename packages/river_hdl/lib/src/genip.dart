@@ -1661,14 +1661,22 @@ class RiverGenIpConfig {
           busDataWidth: busConfig.dataWidth,
           useUsrmclk: isEcp5,
           useStartupe2: isXilinx,
+          // Standalone FPGA builds have no external pad ring, so the controller
+          // owns the bidirectional IO pad (one inout spi_io + internal tristate).
+          ownPads: isEcp5 || isXilinx,
           name: '${mem.type}_$i',
         );
         soc.addPeripheral(flash);
         // Expose the SPI pads. The clock is absent on ECP5 (USRMCLK). Quad/dual
         // flash exposes split tristate IO (spi_io_out/oe/in). Standard mode is
         // spi_mosi/spi_miso.
+        // FPGA targets own the pad (single inout spi_io); otherwise expose the
+        // split tristate for an external pad ring / shared-bus mux.
+        final flashOwnsPads = isEcp5 || isXilinx;
         final dataPins = spiConfig.mode == HarborSpiFlashMode.standard
             ? const ['spi_cs_n', 'spi_mosi', 'spi_miso']
+            : flashOwnsPads
+            ? const ['spi_cs_n', 'spi_io']
             : const ['spi_cs_n', 'spi_io_out', 'spi_io_oe', 'spi_io_in'];
         final spiPins = [if (!isEcp5 && !isXilinx) 'spi_clk', ...dataPins];
         // Prefix when more than one SPI device shares the pinout (multiple flash,
@@ -1758,10 +1766,10 @@ class RiverGenIpConfig {
       _integrateUsbDfu(soc, busConfig, target);
     } else if (usbDfu && usbDfuMode == UsbDfuMode.software) {
       _integrateUsbDfuSoftware(soc, busConfig, target);
-      if (enableDebug) _integrateDebugJtag(soc, busConfig, debugCore!);
+      if (enableDebug) _integrateDebugJtag(soc, busConfig, debugCore!, target);
       soc.buildFabric();
     } else {
-      if (enableDebug) _integrateDebugJtag(soc, busConfig, debugCore!);
+      if (enableDebug) _integrateDebugJtag(soc, busConfig, debugCore!, target);
       soc.buildFabric();
     }
 
@@ -1775,9 +1783,10 @@ class RiverGenIpConfig {
     HarborSoC soc,
     WishboneConfig busConfig,
     RiverCore core,
+    HarborDeviceTarget? target,
   ) {
     final xlen = busConfig.dataWidth;
-    final dbg = RiverDebugSubsystem(busConfig, xlen: xlen);
+    final dbg = RiverDebugSubsystem(busConfig, xlen: xlen, target: target);
     soc.addMaster(dbg, busInterfaceName: 'bus');
 
     // To the core.
@@ -1792,9 +1801,10 @@ class RiverGenIpConfig {
     dbg.input('reg_rdata').srcConnection! <= core.output('debug_reg_rdata');
     dbg.input('reg_ready').srcConnection! <= core.output('debug_reg_ready');
 
-    // No top-level JTAG pads: the TAP comes off the ECP5 config JTAG (dirtyJtag)
-    // via the JTAGG primitive inside the subsystem. OpenOCD reaches it with
-    // `riscv use_bscan_tunnel 6 1` over the ECP5 TAP.
+    // No top-level JTAG pads: the TAP comes off the FPGA config JTAG (ECP5
+    // JTAGG or Xilinx BSCANE2 on USER1, selected by target) inside the
+    // subsystem. OpenOCD reaches it over the config TAP with
+    // `riscv use_bscan_tunnel`.
   }
 
   /// Integrates the USB DFU subsystem into [soc]: instantiates the subsystem

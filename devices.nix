@@ -79,6 +79,7 @@ in
           "0x80000000:64K:sram"
           "0x90000000:128M:dram:arty-s7-x8:ddr3fast=true,clockfreq=400000000,cmdslot=2,wrshift=-1,trainable=true"
         ];
+        devices = creek-v1-base.devices ++ [ "debug-jtag" ];
         bootProgram = "monitor";
         pins = [
           "clk=R2"

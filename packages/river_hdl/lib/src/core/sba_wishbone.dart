@@ -81,10 +81,19 @@ class SbaWishboneAdapter extends Module {
     wbCyc <= sbaReq;
     wbStb <= sbaReq;
     wbWe <= sbaWe;
+    // Beat-align the bus address: the data rides its byte lane (shifted by
+    // byteOff below) with `sel`, so the address must point at the aligned beat,
+    // NOT the raw byte offset. The core's dcache/MMU drive the bus the same way
+    // (line-aligned addr + sel); an unaligned addr here makes the DDR downsizer
+    // route a high-lane (4-mod-8) access to the next beat, so SBA reads/writes of
+    // upper-32-bit halves land on the wrong word.
+    final alignedAddr = selBits == 0
+        ? sbaAddr
+        : [sbaAddr.getRange(selBits, xlen), Const(0, width: selBits)].swizzle();
     wbAdr <=
         (xlen >= addressWidth
-            ? sbaAddr.getRange(0, addressWidth)
-            : sbaAddr.zeroExtend(addressWidth));
+            ? alignedAddr.getRange(0, addressWidth)
+            : alignedAddr.zeroExtend(addressWidth));
 
     // Write data, sign-irrelevant zero-justified to the bus width, shifted up
     // into its addressed byte lane.
