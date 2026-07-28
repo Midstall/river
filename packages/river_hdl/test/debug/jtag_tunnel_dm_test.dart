@@ -53,12 +53,13 @@ class Er1Host {
   }
 
   Future<void> _settle() async {
-    // Let the system clock sample the JTAG-domain levels (edge detect) and
-    // service SBA so DM bus accesses can drain.
-    await clk.nextPosedge;
-    _serviceSba();
-    await clk.nextPosedge;
-    _serviceSba();
+    // Let the system clock sample the JTAG-domain levels (2-FF synchronizer +
+    // edge detect) and service SBA so DM bus accesses can drain. Enough cycles
+    // to cover the synchronizer latency before the next JTAG level is applied.
+    for (var i = 0; i < 4; i++) {
+      await clk.nextPosedge;
+      _serviceSba();
+    }
   }
 
   /// One ER1 TCK pulse with the given shift/update strobes and TDI; returns the

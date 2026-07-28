@@ -154,8 +154,8 @@
       "dependency": "direct overridden",
       "description": {
         "path": "packages/harbor",
-        "ref": "master",
-        "resolved-ref": "4f4352e654e735ae1d117d9087b7fa72583d8dea",
+        "ref": "fix/arty-s7-ddr",
+        "resolved-ref": "cb646f8629d6b69a0e0e54bdf3171cfa0d48bbea",
         "url": "https://github.com/MidstallSoftware/harbor.git"
       },
       "source": "git",

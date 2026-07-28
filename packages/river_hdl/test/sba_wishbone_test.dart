@@ -109,6 +109,34 @@ void main() {
     await wr(0x05, 0x9a, 0);
     expect((await rd(0x05, 0)) & 0xff, equals(0x9a), reason: 'byte lane 5');
 
+    // The bus address MUST be beat-aligned: the lane rides `sel`, so a high-half
+    // (4-mod-8) access must present the aligned beat address, not the raw byte
+    // offset, or the DDR downsizer routes it to the wrong beat. Drive a high-lane
+    // access and sample wb_adr while the request is live.
+    sbaWe.inject(1);
+    sbaAddr.inject(0x8000_1004);
+    sbaWdata.inject(0x1234);
+    sbaSize.inject(2);
+    sbaReq.inject(1);
+    await clk.nextPosedge;
+    expect(
+      dut.output('wb_adr').value.toInt() & 0x7,
+      equals(0),
+      reason: 'wb_adr beat-aligned (low 3 bits clear) for a 4-mod-8 access',
+    );
+    expect(
+      dut.output('wb_adr').value.toInt(),
+      equals(0x8000_1000),
+      reason: 'wb_adr points at the aligned beat, sel selects the high lane',
+    );
+    expect(
+      dut.output('wb_sel').value.toInt(),
+      equals(0xf0),
+      reason: 'high 32-bit lane selected',
+    );
+    sbaReq.inject(0);
+    await clk.nextPosedge;
+
     await Simulator.endSimulation();
   });
 }

@@ -21,13 +21,24 @@ import 'sba_wishbone.dart';
 ///
 /// OpenOCD reaches it with `riscv use_bscan_tunnel 6 1` over the ECP5 TAP.
 /// HW-validation pending; the tunnel framing is the piece to confirm live.
-class RiverDebugSubsystem extends BridgeModule {
+class RiverDebugSubsystem extends BridgeModule implements HarborJtagDebug {
+  /// The debug module's JTAG IDCODE, advertised over the BSCAN tunnel.
+  final int idcode;
+
   RiverDebugSubsystem(
     WishboneConfig config, {
     required int xlen,
-    int idcode = 0x10000001,
+    this.idcode = 0x10000001,
+    // FPGA target: selects the config-JTAG primitive. Xilinx (openXC7/vivado)
+    // taps the config TAP with BSCANE2 on USER1; everything else uses the ECP5
+    // JTAGG. Null (ASIC / no FPGA target) falls back to JTAGG.
+    HarborDeviceTarget? target,
     String? name,
   }) : super('RiverDebugSubsystem', name: name ?? 'debug_jtag') {
+    final useBscane2 =
+        target is HarborFpgaTarget &&
+        (target.vendor == HarborFpgaVendor.openXc7 ||
+            target.vendor == HarborFpgaVendor.vivado);
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     // Core-facing: from the core.
@@ -51,21 +62,42 @@ class RiverDebugSubsystem extends BridgeModule {
     );
     final bus = busRef.internalInterface as WishboneInterface;
 
-    // ECP5 config-JTAG user register taps (ER1).
-    final jtagg = Ecp5Jtagg();
-
-    // Tunnel: ER1 framed scan -> inner TAP signals.
+    // Tunnel: framed config-JTAG DR scan -> inner TAP signals. Fed by the
+    // vendor's config-JTAG user-register primitive below.
     final tunnel = JtagBscanTunnel(maxScanBits: xlen);
     tunnel.input('clk').srcConnection! <= input('clk');
     tunnel.input('reset').srcConnection! <= input('reset');
-    tunnel.input('jtck').srcConnection! <= jtagg.output('JTCK');
-    tunnel.input('jtdi').srcConnection! <= jtagg.output('JTDI');
-    tunnel.input('jshift').srcConnection! <= jtagg.output('JSHIFT');
-    tunnel.input('jupdate').srcConnection! <= jtagg.output('JUPDATE');
-    tunnel.input('jce1').srcConnection! <= jtagg.output('JCE1');
-    tunnel.input('jrstn').srcConnection! <= jtagg.output('JRSTN');
-    jtagg.input('JTDO1').srcConnection! <= tunnel.output('jtdo1');
-    jtagg.input('JTDO2').srcConnection! <= Const(0);
+
+    if (useBscane2) {
+      // Xilinx 7-series BSCANE2 on USER4 (JTAG_CHAIN=4, IR 0x23). riscv-openocd's
+      // bscan tunnel HARDCODES USER4 for tunneled DMI scans (riscv.c select_user4
+      // = 0x23), so the DM must ride USER4, not USER1, or SEL never asserts and
+      // the tunnel returns zeros. Mapped onto the tunnel's JTAGG-style ports.
+      // jtck = TCK, the RAW scan clock (the tunnel FSM matches JTAGG's raw JTCK
+      // and is sim-validated against a continuously toggling clock, so DRCK, the
+      // gated data-register clock, mis-frames it). The tunnel gates advance with
+      // SEL & SHIFT; SEL = this user chain selected (the JCE1 equivalent); the
+      // active-high RESET inverts to the tunnel's active-low jrstn.
+      final bscan = XilinxBscane2(jtagChain: 4);
+      tunnel.input('jtck').srcConnection! <= bscan.output('TCK');
+      tunnel.input('jtdi').srcConnection! <= bscan.output('TDI');
+      tunnel.input('jshift').srcConnection! <= bscan.output('SHIFT');
+      tunnel.input('jupdate').srcConnection! <= bscan.output('UPDATE');
+      tunnel.input('jce1').srcConnection! <= bscan.output('SEL');
+      tunnel.input('jrstn').srcConnection! <= ~bscan.output('RESET');
+      bscan.input('TDO').srcConnection! <= tunnel.output('jtdo1');
+    } else {
+      // ECP5 config-JTAG user register taps (ER1).
+      final jtagg = Ecp5Jtagg();
+      tunnel.input('jtck').srcConnection! <= jtagg.output('JTCK');
+      tunnel.input('jtdi').srcConnection! <= jtagg.output('JTDI');
+      tunnel.input('jshift').srcConnection! <= jtagg.output('JSHIFT');
+      tunnel.input('jupdate').srcConnection! <= jtagg.output('JUPDATE');
+      tunnel.input('jce1').srcConnection! <= jtagg.output('JCE1');
+      tunnel.input('jrstn').srcConnection! <= jtagg.output('JRSTN');
+      jtagg.input('JTDO1').srcConnection! <= tunnel.output('jtdo1');
+      jtagg.input('JTDO2').srcConnection! <= Const(0);
+    }
 
     // Nets feeding the DM's SBA response, driven by the adapter below.
     final sbaRdata = Logic(name: 'sba_rdata', width: xlen);
@@ -121,4 +153,10 @@ class RiverDebugSubsystem extends BridgeModule {
     bus.datMosi <= adapter.output('wb_dat_mosi');
     bus.sel <= adapter.output('wb_sel');
   }
+
+  @override
+  int get jtagInnerIrWidth => 5; // RISC-V DTM (dtmcs/dmi) IR width
+
+  @override
+  int? get jtagDmIdcode => idcode;
 }
