@@ -15,6 +15,7 @@
       url = "github:MidstallSoftware/asix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    openxc7.url = "github:openXC7/toolchain-nix";
   };
 
   outputs =
@@ -54,6 +55,7 @@
         {
           system,
           pkgs,
+          inputs',
           ...
         }:
         let
@@ -116,7 +118,14 @@
           # above in _module.args.pkgs.
           overlayAttrs = {
             flakever = flakeverConfig;
-            river-hdl = pkgs.callPackage ./pkgs/river-hdl { };
+            river-hdl = pkgs.callPackage ./pkgs/river-hdl {
+              # openXC7 Xilinx toolchain: mkFpga uses it for spartan7 targets.
+              # The chipdb/nextpnr/prjxray come from the flake's per-system
+              # packages; the python deps for prjxray's fasm2frames come from
+              # openXC7's own pinned nixpkgs (a consistent 3.12 set).
+              openxc7 = inputs'.openxc7.packages;
+              openxc7Nixpkgs = inputs.openxc7.inputs.nixpkgs.legacyPackages.${system};
+            };
           };
 
           checks = {
@@ -158,6 +167,7 @@
               fpgaVendors = [
                 "ecp5"
                 "ice40"
+                "spartan7"
               ];
               asicVendors = [
                 "sky130"

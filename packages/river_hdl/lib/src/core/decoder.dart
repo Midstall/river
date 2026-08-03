@@ -336,11 +336,49 @@ class DynamicInstructionDecoder extends InstructionDecoder {
       microcode.typeStructs.length.bitLength,
     );
 
+    // Parallel decode lanes: microcodeRead.data holds `lanes` pattern rows
+    // (lane 0 in the low bits). Match the instruction against every lane this
+    // cycle and priority-select the lowest-index matching row, so the scan
+    // advances `lanes` patterns per cycle instead of one. lanes==1 degenerates
+    // to reading the single row straight through.
+    final rowW = microcode.patternWidth;
+    final lanes = microcodeRead.data.width ~/ rowW;
+    Logic laneRow(int lane) =>
+        microcodeRead.data.getRange(lane * rowW, (lane + 1) * rowW);
+    Logic rowField(Logic row, String name) {
+      final r = patternStruct.mapping[name]!;
+      return row.getRange(r.start, r.end + 1);
+    }
+
+    Logic laneMatch(Logic row) {
+      final pm = (instr & rowField(row, 'mask')).eq(rowField(row, 'value'));
+      final nzf = mux(
+        rowField(row, 'nzfMask').neq(0),
+        (instr & rowField(row, 'nzfMask')).neq(0),
+        Const(1),
+      );
+      final zf = mux(
+        rowField(row, 'zfMask').neq(0),
+        (instr & rowField(row, 'zfMask')).eq(0),
+        Const(1),
+      );
+      return pm & nzf & zf;
+    }
+
+    var selData = laneRow(lanes - 1);
+    for (var l = lanes - 2; l >= 0; l--) {
+      selData = mux(
+        laneMatch(laneRow(l)),
+        laneRow(l),
+        selData,
+      ).named('decodeSelData_$l');
+    }
+
     final pattern = Map.fromEntries(
       patternStruct.mapping.entries.map((entry) {
         final patternName = entry.key;
         final range = entry.value;
-        final value = microcodeRead.data.getRange(range.start, range.end + 1);
+        final value = selData.getRange(range.start, range.end + 1);
         return MapEntry(patternName, value);
       }),
     );
@@ -395,7 +433,9 @@ class DynamicInstructionDecoder extends InstructionDecoder {
         then: [microcodeRead.en < 0, done < 1, valid < 1],
         orElse: [
           microcodeRead.en < 1,
-          microcodeRead.addr < _counter,
+          // _counter is sized for the unpacked pattern count; the packed ROM has
+          // ceil(patterns/lanes) words, so its address port is narrower.
+          microcodeRead.addr < _counter.getRange(0, microcodeRead.addr.width),
           If(
             microcodeRead.done,
             then: [

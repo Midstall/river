@@ -62,11 +62,23 @@ in
   };
 
   # Digilent Arty S7-50 (xc7s50, csga324, 100MHz osc), Xilinx via the openXC7
-  # flow. DDR3 runs as x8 on the low byte-lane (arty-s7-x8, 128MB): the
-  # hardware-verified read and write path at cmdslot=2,wrshift=-1. The x16 high
-  # lane (per-lane write-leveling) is still under debug. Boot monitor runs from
-  # the 64K EBR SRAM and DDR is promoted separately. Pins from the working
-  # bring-up (clk=R2, UART R12/V12).
+  # flow. The DDR3 is the silicon-proven ddr3v2 stack (the harbor-native ROHD
+  # port of UberDDR3): full x16 256MB (MT41K128M16) at 300MHz CK. This PHY runs
+  # its OWN calibration in hardware, so the host does not need a training pass.
+  # cmdslot=2 sets the command slot and wrshift=-1 sets the write launch. Add
+  # train=runtime to the dram params to expose the FSBL knob-ABI window instead
+  # (per controller, optional).
+  #
+  # FSBL-from-SRAM boot (the DDR bootstrap decouple): a 64K on-chip BRAM at
+  # 0x08000000 holds the FSBL stack, .data and .bss (its console struct
+  # included), so the FSBL runs, prints and can drive the DDR WITHOUT a working
+  # DRAM read first. The maskrom xipboot runs the FSBL in place from flash XIP.
+  # The FSBL scratch lives in the SRAM (weir tools/fdt_ld.zig routes it there
+  # when the tree has an mmio-sram node), then it copies main Weir into DRAM.
+  # DRAM stays at 0x80000000 so Weir and Ferrite link there unchanged.
+  #
+  # clk MUST be SSTL135: R2 is on the 1.35V DDR bank, so `clk=R2` alone
+  # (defaults to LVCMOS33) yields a dead SoC, the clock is never received.
   creek-v1-arty = {
     ip = river-hdl.mkSoC (
       creek-v1-base
@@ -76,13 +88,13 @@ in
         oscFreq = 100000000;
         memories = [
           "0x20000000:16M:flash:arty-s7"
-          "0x80000000:64K:sram"
-          "0x90000000:128M:dram:arty-s7-x8:ddr3fast=true,clockfreq=400000000,cmdslot=2,wrshift=-1,trainable=true"
+          "0x08000000:64K:sram"
+          "0x80000000:256M:dram:arty-s7:ddr3v2=true,clockfreq=300000000,cmdslot=2,wrshift=-1,trainable=true"
         ];
         devices = creek-v1-base.devices ++ [ "debug-jtag" ];
-        bootProgram = "monitor";
+        bootProgram = "xipboot";
         pins = [
-          "clk=R2"
+          "clk=R2 SSTL135"
           "uart_tx=uart@tx:R12"
           "uart_rx=uart@rx:V12"
         ];

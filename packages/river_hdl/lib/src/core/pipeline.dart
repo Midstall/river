@@ -706,6 +706,7 @@ class RiverPipeline extends Module {
               kBranchCond,
               kIsJump,
               kIsJalr,
+              kIsCompressed,
               kUseImm,
               kSignExtend,
               if (dualDispatch) ...[
@@ -729,6 +730,7 @@ class RiverPipeline extends Module {
                 kBranchCond1,
                 kIsJump1,
                 kIsJalr1,
+                kIsCompressed1,
                 kUseImm1,
                 kSignExtend1,
               ],
@@ -792,6 +794,10 @@ class RiverPipeline extends Module {
       decodeNode[kBranchCond] <= ctrlRom.branchCond;
       decodeNode[kIsJump] <= ctrlRom.isJump;
       decodeNode[kIsJalr] <= ctrlRom.isJalr;
+      // Compressed-ness rides alongside the instruction (kInstruction <=
+      // fetchOutResult = cfb.instr0), so the branch unit can form the link as
+      // PC+2. Non-compressed fetchers carry no C-ext ops, so 0 is correct there.
+      decodeNode[kIsCompressed] <= (cfb?.compressed0 ?? Const(0));
       decodeNode[kUseImm] <= ctrlRom.useImm;
       decodeNode[kSignExtend] <= ~ctrlRom.memUnsigned;
       decodeNode.valid <= decodeDone & decodeValid;
@@ -819,6 +825,7 @@ class RiverPipeline extends Module {
         decodeNode[kBranchCond1] <= ctrlRom1.branchCond;
         decodeNode[kIsJump1] <= ctrlRom1.isJump;
         decodeNode[kIsJalr1] <= ctrlRom1.isJalr;
+        decodeNode[kIsCompressed1] <= cfb.compressed1;
         decodeNode[kUseImm1] <= ctrlRom1.useImm;
         decodeNode[kSignExtend1] <= ~ctrlRom1.memUnsigned;
       }
@@ -1308,6 +1315,7 @@ class RiverPipeline extends Module {
         enqBranchCond0: renameNode[kBranchCond],
         enqIsJump0: renameNode[kIsJump],
         enqIsJalr0: renameNode[kIsJalr],
+        enqIsCompressed0: renameNode[kIsCompressed],
         enqUseImm0: renameNode[kUseImm],
         // CSR op = funct3 (instr[14:12]); CSR address = instr[31:20]. The
         // CsrUnit maps funct3 → read/set/clear (+ immediate variants).
@@ -1344,6 +1352,7 @@ class RiverPipeline extends Module {
             : Const(0, width: 3),
         enqIsJump1: dualDispatch ? renameNode[kIsJump1] : Const(0),
         enqIsJalr1: dualDispatch ? renameNode[kIsJalr1] : Const(0),
+        enqIsCompressed1: dualDispatch ? renameNode[kIsCompressed1] : Const(0),
         enqUseImm1: dualDispatch ? renameNode[kUseImm1] : Const(0),
         enqCsrOp1: dualDispatch
             ? fitWidth(renameNode[kInstruction1], 32).slice(14, 12)
@@ -1628,6 +1637,7 @@ class RiverPipeline extends Module {
         issueCondition: iq.dispatchBranchCondition,
         issueIsJump: iq.dispatchBranchIsJump,
         issueIsJalr: iq.dispatchBranchIsJalr,
+        issueIsCompressed: iq.dispatchBranchIsCompressed,
         issuePredictedTaken: branchUnitPredTaken,
         flush: flushOrRedirect,
         xlen: mxlen.size,

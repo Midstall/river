@@ -1096,12 +1096,39 @@ abstract class ExecutionUnit extends Module {
     Logic causeCode, [
     Logic? tval,
     String? suffix,
+    Logic? modeCause,
   ]) {
     suffix ??= '';
 
+    // A trap op with modeCause set re-encodes its cause from the originating
+    // privilege/virt: ECALL becomes U/VU=8, HS=9, VS=10, M=11. Every other trap
+    // keeps its fixed causeCode. Centralized here so the static path, the
+    // microcode path, and any future privilege-dependent trap share one cause
+    // encoding (the switched cause also feeds delegation via
+    // selectTrapTargetMode below).
+    final effCause = (modeCause == null)
+        ? causeCode
+        : mux(
+            modeCause,
+            mux(
+              currentMode.eq(Const(PrivilegeMode.machine.id, width: 3)),
+              Const(11, width: 6),
+              mux(
+                currentMode.eq(Const(PrivilegeMode.supervisor.id, width: 3)),
+                mux(
+                  virtIn ?? Const(0),
+                  Const(10, width: 6),
+                  Const(9, width: 6),
+                ),
+                Const(8, width: 6),
+              ),
+            ),
+            causeCode,
+          );
+
     if (csrRead == null || csrWrite == null) {
       return [
-        trapCause < encodeCause(trapInterrupt, causeCode).slice(5, 0),
+        trapCause < encodeCause(trapInterrupt, effCause).slice(5, 0),
         trapTval < (tval ?? Const(0, width: mxlen.size)),
         output('trapEpc') < currentPc,
         output('trap') < 1,
@@ -1114,7 +1141,7 @@ abstract class ExecutionUnit extends Module {
 
     final newMode = selectTrapTargetMode(
       trapInterrupt,
-      causeCode,
+      effCause,
       currentMode,
       mideleg,
       medeleg,
@@ -1126,7 +1153,7 @@ abstract class ExecutionUnit extends Module {
       trapCause <
           encodeCause(
             trapInterrupt,
-            causeCode,
+            effCause,
           ).slice(5, 0).named('cause$suffix'),
       trapTval < (tval ?? Const(0, width: mxlen.size)),
       output('trapEpc') < currentPc,
@@ -1149,7 +1176,7 @@ abstract class ExecutionUnit extends Module {
                     stvec ?? Const(0, width: mxlen.size),
                   )
                 : (mtvec ?? Const(0, width: mxlen.size))),
-            causeCode,
+            effCause,
             trapInterrupt,
             suffix: suffix,
           ),
@@ -2434,9 +2461,15 @@ class DynamicExecutionUnit extends ExecutionUnit {
                     ],
                   ),
                   CaseItem(Const(TrapMicroOp.funct, width: funct.width), [
+                    // The micro-op's own modeCause bit drives the switch: when
+                    // set (ecall), rawTrap re-encodes the cause by privilege.
+                    // No RTL heuristic on the cause value.
                     ...rawTrap(
                       mop['Trap']!['isInterrupt']!,
                       mop['Trap']!['causeCode']!,
+                      null,
+                      null,
+                      mop['Trap']!['modeCause']!,
                     ),
                   ]),
                   CaseItem(Const(BranchIfMicroOp.funct, width: funct.width), [
@@ -4992,37 +5025,19 @@ class StaticExecutionUnit extends ExecutionUnit {
                     );
                   }
                 } else if (mop is RiscVTrapOp) {
-                  // ECALL's cause depends on the originating privilege/virt:
-                  // U/VU=8, HS=9, VS=10, M=11. (ebreak and the rest keep their
-                  // fixed cause.) Harbor's microcode hardcodes 8.
-                  final isEcall = !mop.isInterrupt && mop.causeCode == 8;
-                  final causeCode = isEcall
-                      ? mux(
-                          currentMode.eq(
-                            Const(PrivilegeMode.machine.id, width: 3),
-                          ),
-                          Const(11, width: 6),
-                          mux(
-                            currentMode.eq(
-                              Const(PrivilegeMode.supervisor.id, width: 3),
-                            ),
-                            mux(
-                              virtIn ?? Const(0),
-                              Const(10, width: 6),
-                              Const(9, width: 6),
-                            ),
-                            Const(8, width: 6),
-                          ),
-                        )
-                      : Const(mop.causeCode, width: 6);
+                  // The micro-op's modeCause bit decides: ecall re-encodes its
+                  // cause by privilege (U/VU=8, HS=9, VS=10, M=11); ebreak and
+                  // the rest keep their fixed cause. Same switch the microcode
+                  // path uses, driven by the same flag.
                   steps.add(
                     CaseItem(
                       Const(i, width: maxLen.bitLength),
                       rawTrap(
                         Const(mop.isInterrupt ? 1 : 0),
-                        causeCode,
+                        Const(mop.causeCode, width: 6),
                         null,
                         '_${op.mnemonic}',
+                        Const(mop.modeCause ? 1 : 0),
                       ),
                     ),
                   );

@@ -36,6 +36,11 @@ class DeviceParams {
   /// Expose the CPU read-training MMIO window (HarborDdrController.trainableRead).
   final bool? trainable;
 
+  /// ddr3v2 training mode: `train=runtime` exposes the knob-ABI window so the
+  /// FSBL sweep engine drives calibration; `train=hw` (default) keeps the
+  /// controller's internal cal FSM. Distinct from the legacy [trainable].
+  final bool? runtimeTrain;
+
   /// ddr3Fast command CK edge (0..3), forwarded to the Xilinx PHY.
   final int? cmdSlot;
 
@@ -60,12 +65,46 @@ class DeviceParams {
   /// Hardware write-verify-retry on every array write.
   final bool? writeVerify;
 
+  /// Hardware MPR read-calibration: the sequencer sweeps each byte lane's read
+  /// window x IDELAY tap against the DRAM MPR pattern and locks the eye before
+  /// the bus opens (ddr3Fast only). Kills the per-boot read coin-flip.
+  final bool? readLevel;
+
+  /// Post-read-cal cadence self-test: bus opens only after a varied-cadence read
+  /// verify passes (ddr3Fast + readlevel only). Kills the read cadence coin-flip.
+  final bool? selfTest;
+
+  /// Expose the DDR controller's dbg_la LA-probe bundle ([3:0]=stateCode,
+  /// [4]=rd_cal_active, [5]=phy.rdValid) to top pins so a logic analyzer can
+  /// watch the sequencer FSM + read completion live (bus-independent). The 6
+  /// dbg_la[*] pins must be assigned via --pin.
+  final bool? laprobe;
+
   /// Diagnostic MR3.MPR mode (every read returns the part MPR pattern).
   final bool? mpr;
 
   /// Real-speed DDR3-667 ISERDESE2 datapath (else the DLL-off IDDR read path).
   /// Per controller: two dram devices may differ.
   final bool? ddr3Fast;
+
+  /// Use the new silicon-proven [HarborDdr3] stack (Ddr3Controller + Ddr3Phy,
+  /// with proper calibration + bank anticipate) instead of the legacy
+  /// HarborDdrController + DdrSequencer/DdrPhyXilinx. Implies ddr3Fast.
+  final bool? ddr3v2;
+
+  /// Open the ddr3Fast read window from the DRAM's read strobe (DQS as data) so
+  /// each read self-frames, instead of a fixed CL tap that mis-frames under the
+  /// i+d cadence. ddr3Fast only.
+  final bool? dqsGate;
+
+  /// LiteDRAM read margin: extra CK added to the programmed DRAM CAS latency
+  /// (MR0) so the read burst lands one memory-clock phase INTO the ISERDESE2
+  /// word, not at the CLKDIV edge where setup/hold is marginal and the i+d read
+  /// cadence tips it over. LiteDRAM s7ddrphy notes "Artix-7 requires read data
+  /// one memory-clock phase into the ISERDESE2 word for reliable read leveling"
+  /// (originally CL+1 in MR0). The DRAM drives read data [readClExtra] CK later,
+  /// clTicks/MR0 track it, and the FSBL read sweep re-centres. ddr3Fast only.
+  final int? readClExtra;
 
   /// DRAM clock-domain (CDC) frequency in Hz. Above the oscillator PLLs the
   /// `ddr` domain to a higher DLL-off / DLL-on rate than the core drives.
@@ -91,6 +130,7 @@ class DeviceParams {
 
   const DeviceParams({
     this.trainable,
+    this.runtimeTrain,
     this.cmdSlot,
     this.wrShift,
     this.wrBeat,
@@ -99,8 +139,14 @@ class DeviceParams {
     this.readRetry,
     this.window,
     this.writeVerify,
+    this.readLevel,
+    this.selfTest,
+    this.laprobe,
     this.mpr,
     this.ddr3Fast,
+    this.ddr3v2,
+    this.dqsGate,
+    this.readClExtra,
     this.clockFreq,
     this.oscFreq,
     this.mode,
@@ -111,6 +157,7 @@ class DeviceParams {
   /// Accepted param keys (case-insensitive), for error messages.
   static const _keys = [
     'trainable',
+    'train',
     'cmdslot',
     'wrshift',
     'wrbeat',
@@ -119,8 +166,14 @@ class DeviceParams {
     'readretry',
     'window',
     'writeverify',
+    'readlevel',
+    'selftest',
+    'laprobe',
     'mpr',
     'ddr3fast',
+    'ddr3v2',
+    'dqsgate',
+    'readclextra',
     'clockfreq',
     'oscfreq',
     'mode',
@@ -149,6 +202,7 @@ class DeviceParams {
   /// contain `=`.
   static DeviceParams parse(String s) {
     bool? trainable;
+    bool? runtimeTrain;
     int? cmdSlot;
     int? wrShift;
     int? wrBeat;
@@ -157,8 +211,14 @@ class DeviceParams {
     int? readRetry;
     int? window;
     bool? writeVerify;
+    bool? readLevel;
+    bool? selfTest;
+    bool? laprobe;
     bool? mpr;
     bool? ddr3Fast;
+    bool? ddr3v2;
+    bool? dqsGate;
+    int? readClExtra;
     int? clockFreq;
     int? oscFreq;
     String? mode;
@@ -174,6 +234,11 @@ class DeviceParams {
       switch (key) {
         case 'trainable':
           trainable = _parseBool(val);
+        case 'train':
+          if (val != 'hw' && val != 'runtime') {
+            throw FormatException('train must be hw|runtime, got: $val');
+          }
+          runtimeTrain = val == 'runtime';
         case 'cmdslot':
           cmdSlot = int.parse(val);
         case 'wrshift':
@@ -190,10 +255,22 @@ class DeviceParams {
           window = int.parse(val);
         case 'writeverify':
           writeVerify = _parseBool(val);
+        case 'readlevel':
+          readLevel = _parseBool(val);
+        case 'selftest':
+          selfTest = _parseBool(val);
+        case 'laprobe':
+          laprobe = _parseBool(val);
         case 'mpr':
           mpr = _parseBool(val);
         case 'ddr3fast':
           ddr3Fast = _parseBool(val);
+        case 'ddr3v2':
+          ddr3v2 = _parseBool(val);
+        case 'dqsgate':
+          dqsGate = _parseBool(val);
+        case 'readclextra':
+          readClExtra = int.parse(val);
         case 'clockfreq':
           clockFreq = int.parse(val);
         case 'oscfreq':
@@ -217,6 +294,7 @@ class DeviceParams {
     }
     return DeviceParams(
       trainable: trainable,
+      runtimeTrain: runtimeTrain,
       cmdSlot: cmdSlot,
       wrShift: wrShift,
       wrBeat: wrBeat,
@@ -225,8 +303,14 @@ class DeviceParams {
       readRetry: readRetry,
       window: window,
       writeVerify: writeVerify,
+      readLevel: readLevel,
+      selfTest: selfTest,
+      laprobe: laprobe,
       mpr: mpr,
       ddr3Fast: ddr3Fast,
+      ddr3v2: ddr3v2,
+      dqsGate: dqsGate,
+      readClExtra: readClExtra,
       clockFreq: clockFreq,
       oscFreq: oscFreq,
       mode: mode,
@@ -238,6 +322,44 @@ class DeviceParams {
 
 /// Deprecated alias, retained while [MemoryRegion.ddrParams] still uses this name.
 typedef DdrRegionParams = DeviceParams;
+
+/// Target-aware flash partition layout. Pure, so the DT `fixed-partitions` node
+/// and xipboot's jump target computed from it stay in agreement across call
+/// sites. An FPGA reserves slot 0 for the config bitstream (master-SPI self-boot
+/// from flash); an ASIC has no fabric to configure, so the FSBL is the reset
+/// payload at offset 0.
+({int fsblOffset, int firmwareOffset, List<HarborFlashPartition> partitions})
+flashLayout(Object? target, int flashSize) {
+  // The uncompressed 7-series bitstream size is FIXED per device (the full
+  // configuration memory), design-independent. Round the reserved slot up to
+  // 1 MiB so the FSBL clears it.
+  const bitstreamBytes = <String, int>{'xc7s50': 2192012};
+  final isFpga = target is HarborFpgaTarget;
+  final bitSlot = isFpga
+      ? (((bitstreamBytes[target.device] ?? 0x300000) + 0xfffff) & ~0xfffff)
+      : 0;
+  final fsblOffset = bitSlot;
+  const fsblSize = 0x100000; // 1 MiB, generous for the XIP FSBL
+  final firmwareOffset = fsblOffset + fsblSize;
+  return (
+    fsblOffset: fsblOffset,
+    firmwareOffset: firmwareOffset,
+    partitions: [
+      if (isFpga)
+        HarborFlashPartition(label: 'fpga-bitstream', offset: 0, size: bitSlot),
+      HarborFlashPartition(
+        label: 'river-fsbl',
+        offset: fsblOffset,
+        size: fsblSize,
+      ),
+      HarborFlashPartition(
+        label: 'river-firmware',
+        offset: firmwareOffset,
+        size: flashSize - firmwareOffset,
+      ),
+    ],
+  );
+}
 
 class MemoryRegion {
   final int address;
@@ -918,8 +1040,11 @@ class RiverGenIpConfig {
   // old global flags.
 
   /// True when ANY `dram` device selects the ISERDESE2 datapath.
-  bool get ddr3Fast =>
-      devices.any((d) => d.type == 'dram' && (d.params?.ddr3Fast ?? false));
+  bool get ddr3Fast => devices.any(
+    (d) =>
+        d.type == 'dram' &&
+        ((d.params?.ddr3Fast ?? false) || (d.params?.ddr3v2 ?? false)),
+  );
 
   /// DRAM clock-domain (CDC) frequency: the first `dram` device that sets one.
   int? get ddrClockFrequency {
@@ -1426,6 +1551,48 @@ class RiverGenIpConfig {
           ddr3Cwl = tCkPs >= 2500 ? 5 : (tCkPs >= 1875 ? 6 : 7);
         }
         final ddr3CwlEff = ddr3Cwl;
+        // --- new silicon-proven Ddr3Controller stack (ddr3v2) ---
+        if (mem.ddrParams?.ddr3v2 ?? false) {
+          final ddr = HarborDdr3(
+            config: board.config,
+            baseAddress: mem.address,
+            clockHz: ctrlHz,
+            busAddressWidth: busConfig.addressWidth,
+            busDataWidth: busConfig.dataWidth,
+            target: target,
+            // Match the DDR3 CK the tree actually solves (set clockfreq=
+            // 300000000 on the device for the proven 300 MHz x16 point).
+            ckPeriodPs: (1e6 / tree.ddrCkMhz).round(),
+            // train=runtime exposes the knob-ABI window for the FSBL engine.
+            runtimeTrainable: mem.ddrParams?.runtimeTrain ?? false,
+            name: '${mem.type}_$i',
+          );
+          soc.addPeripheral(ddr);
+          if (mem.ddrParams?.runtimeTrain ?? false) {
+            // The knob-ABI window is a second bus slave carved from the top page
+            // of the DRAM aperture (usableSize excludes it). Map it explicitly.
+            soc.addPeripheralSlave(
+              ddr,
+              'train',
+              BusAddressRange(ddr.trainBase, HarborDdr3.trainWindowSize),
+            );
+          }
+          ddr.input('ddr_clk').srcConnection! <= tree.controller;
+          final sysDomainForDdr = soc.clockDomain('sys');
+          if (sysDomainForDdr == null) {
+            throw StateError('ddr3v2 needs the sys clock domain for ddr_reset');
+          }
+          ddr.input('ddr_reset').srcConnection! <= sysDomainForDdr.reset;
+          ddr.input('ddr_ck_fast').srcConnection! <= tree.ddrCk;
+          ddr.input('ddr_ck90_fast').srcConnection! <= tree.ddrCk90;
+          ddr.input('ddr_ck_dqs_fast').srcConnection! <= tree.ddrCkDqs;
+          ddr.input('ddr_idelay_ref').srcConnection! <= tree.idelayRef;
+          final padPorts = [...DdrBoard.padPorts, 'sdram_dqs_n'];
+          for (final pad in padPorts) {
+            soc.exposePin(ddr, pad, externalName: pad);
+          }
+          continue;
+        }
         final ddr = HarborDdrController(
           config: board.config,
           baseAddress: mem.address,
@@ -1437,9 +1604,15 @@ class RiverGenIpConfig {
           asyncClock: true,
           // The real-speed ISERDESE2 DW8 read gearbox.
           ddr3Fast: true,
+          // Open the read window from the DRAM's read strobe (DQS as data) so each
+          // read self-frames instead of a fixed CL tap (region `dqsgate` param).
+          dqsGatedRead: mem.ddrParams?.dqsGate ?? false,
           ddr3FastCkMhz: tree.ddrCkMhz,
           ddr3FastIdelayRefMhz: tree.idelayRefMhz,
-          ddr3FastCl: ddr3Cl,
+          // LiteDRAM one-memory-clock-phase read margin: the DRAM drives read
+          // data readClExtra CK later so the burst lands INTO the ISERDESE2 word
+          // (not at the marginal CLKDIV edge). CWL/writes untouched.
+          ddr3FastCl: ddr3Cl + (mem.ddrParams?.readClExtra ?? 0),
           ddr3FastCwl: ddr3CwlEff,
           // ddr3Fast write/command timing. Effective value = region param, else
           // board default, else the global default. cmdSlot/wrShift/window fall
@@ -1475,6 +1648,27 @@ class RiverGenIpConfig {
           // DdrBoard so a plain build is correct with no extra flag. A region
           // param can still force it on/off.
           writeVerify: mem.ddrParams?.writeVerify ?? board.writeVerify,
+          // Hardware MPR read-calibration before the bus opens (openXC7 ddr3Fast
+          // read eye drifts per boot). Board default, region param can override.
+          readLevel: mem.ddrParams?.readLevel ?? board.readLevel,
+          selfTest: mem.ddrParams?.selfTest ?? board.selfTest,
+          // Write-leveling / write-DQS actuator on the ddr3Fast (Xilinx) path.
+          // This was MISSING from this controller call (only the legacy/ECP5 call
+          // below had it), so writeLevel silently defaulted to false and the whole
+          // Xilinx WL + write-beat block never built. Same DLL-on-band gate as the
+          // ECP5 call. Needed for the runtime write-beat override at rated CK.
+          writeLevel:
+              (ddrClockFrequency != null &&
+                  ddrClockFrequency! > oscFrequency) &&
+              (mem.ddrParams?.trainable ??
+                  board.trainable ??
+                  const {
+                    'ddrtest',
+                    'ddrprobe',
+                    'ddrlevel',
+                    'ddreye',
+                    'ddrdiag',
+                  }.contains(bootProgram)),
           name: '${mem.type}_$i',
         );
         soc.addPeripheral(ddr);
@@ -1630,19 +1824,32 @@ class RiverGenIpConfig {
         for (final pad in padPorts) {
           soc.exposePin(ddr, pad, externalName: pad);
         }
+        // LA probe: expose the DDR controller's 6-bit dbg_la bundle
+        // ([3:0]=stateCode [4]=rd_cal_active [5]=phy.rdValid) as top pins so a
+        // logic analyzer can watch the read-cal FSM + read completion live
+        // (bus-independent). Gated on the dram `laprobe=true` param; the
+        // dbg_la[*] pads come from --pin.
+        if (mem.ddrParams?.laprobe ?? false) {
+          soc.exposePin(ddr, 'dbg_la', externalName: 'dbg_la');
+        }
       } else if (mem.type == 'flash') {
         // Real SPI NOR flash with XIP: the CPU fetches firmware directly from the
         // part, no on-chip copy. 16MB maps to the W25Q128 (the OrangeCrab/
         // iCEBreaker part). Other sizes get a generic quad-read config sized to
         // the region.
+        // Target-aware partition map (fpga-bitstream on FPGA + river-fsbl +
+        // river-firmware): the FSBL reads its firmware offset from this and
+        // Linux exposes each as /dev/mtdN.
+        final flashParts = flashLayout(target, mem.size).partitions;
         final spiConfig = mem.size == 16 * 1024 * 1024
-            ? const HarborSpiFlashConfig.w25q128()
+            ? HarborSpiFlashConfig.w25q128(partitions: flashParts)
             : HarborSpiFlashConfig(
                 size: mem.size,
                 mode: HarborSpiFlashMode.quad,
                 readCommand: 0x6B,
                 addressBytes: mem.size > 16 * 1024 * 1024 ? 4 : 3,
                 dummyCycles: 8,
+                partitions: flashParts,
               );
         // The config-flash clock has no I/O pad on either family: route it
         // through the ECP5 USRMCLK macro or the Xilinx STARTUPE2 (USRCCLKO ->
@@ -2429,13 +2636,20 @@ class RiverGenIpConfig {
         // from the BRAM boot ROM (reset vector), warm up the flash XIP controller
         // (the Xilinx STARTUPE2/CCLK path is not fetch-ready at the first
         // cold-reset cycle), then jump to the FSBL executing IN PLACE from flash.
-        // The FSBL is flashed at the flash region base (QSPI 0, free because the
-        // bitstream is JTAG-loaded). Main Weir sits above it and the FSBL copies
-        // it into DRAM.
+        // The FSBL lives at the `river-fsbl` partition offset: on an FPGA that is
+        // ABOVE the config bitstream (slot 0 holds the bitstream for master-SPI
+        // self-boot), on an ASIC it is flash base. Main Weir sits above the FSBL
+        // and the FSBL copies it into DRAM. Same layout the DT partitions carry.
         final flash = flashRegion;
         if (flash == null) {
           throw StateError('xipboot boot program needs a flash region');
         }
+        // Use the HARBOR target (buildTarget()), not the genip `target` field:
+        // flashLayout keys FPGA-vs-ASIC on `is HarborFpgaTarget`, and the field
+        // is genip's own Target type, so it would wrongly fall to the ASIC
+        // offset 0 and xipboot would jump into the bitstream slot instead of the
+        // relocated FSBL. Matches the flash/DT site (buildSoC uses buildTarget()).
+        final fsblOffset = flashLayout(buildTarget(), flash.size).fsblOffset;
         final stackMem = memories.firstWhere(
           (m) => m.type != 'flash',
           orElse: () => flash,
@@ -2444,8 +2658,8 @@ class RiverGenIpConfig {
           RiverMaskromConfig(
             isa: coreConfig.isa,
             resetVector: coreConfig.resetVector,
-            flashSource: flash.address,
-            copyDest: flash.address, // jump target = FSBL entry (flash base)
+            flashSource: flash.address + fsblOffset,
+            copyDest: flash.address + fsblOffset, // jump target = FSBL entry
             copySize: 256, // warmup read window
             stackTop: stackMem.address + stackMem.size,
             bootMode: RiverBootMode.xipLaunch,

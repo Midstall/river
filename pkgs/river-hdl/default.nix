@@ -8,6 +8,12 @@
   trellis,
   surfer,
   flakever,
+  # openXC7 toolchain package set (from the openxc7 flake input). Null keeps
+  # mkFpga on the iCE40/ECP5 path only; spartan7 targets need it.
+  openxc7 ? null,
+  # openXC7's own pinned nixpkgs, for the python 3.12 deps that prjxray's
+  # fasm2frames imports. Null alongside a spartan7 target is a build error.
+  openxc7Nixpkgs ? null,
 }:
 buildDartApplication (finalAttrs: {
   pname = "river-hdl";
@@ -44,6 +50,8 @@ buildDartApplication (finalAttrs: {
         nextpnr
         icestorm
         trellis
+        openxc7
+        openxc7Nixpkgs
         ;
     };
   };

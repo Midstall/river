@@ -83,6 +83,10 @@ class RiverCoreConfigV1 extends RiverCoreConfig {
          // not just a perf choice. Microcode datapath (shared ALU) over the
          // static fabric: ~12k vs ~21k LUT on small FPGAs.
          microcodeMode: MicrocodeMode.full,
+         // Decode 2 pattern-ROM entries/cycle: halves the decode pattern-scan
+         // (the biggest per-instruction cost) for a couple of comparators of
+         // area, staying fully microcoded + patchable. Bigger tiers scale up.
+         microcodeDecodeLanes: 2,
        );
 
   /// RC1.f - River Core V1 full (RV64GC_Zicsr_Zifencei), in-order single-issue,

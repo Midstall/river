@@ -36,6 +36,7 @@ class BranchUnit extends Module {
     required Logic issueCondition,
     required Logic issueIsJump,
     required Logic issueIsJalr,
+    required Logic issueIsCompressed,
     required Logic issuePredictedTaken,
     required Logic flush,
     this.xlen = 64,
@@ -62,6 +63,10 @@ class BranchUnit extends Module {
 
     /// Whether this is JALR (target = rs1 + imm, not pc + imm).
     issueIsJalr = addInput('issue_is_jalr', issueIsJalr);
+
+    /// Whether the branch/jump instruction was a 2-byte compressed (RVC) op, so
+    /// the link (return) address is PC+2 rather than PC+4.
+    issueIsCompressed = addInput('issue_is_compressed', issueIsCompressed);
 
     /// Predicted taken (from front-end, for detecting mispredictions).
     issuePredictedTaken = addInput(
@@ -125,8 +130,18 @@ class BranchUnit extends Module {
       issuePc + issueImm,
     ).named('branch_target');
 
-    // Next sequential PC (for not-taken branches and link address)
-    final nextPc = (issuePc + Const(4, width: xlen)).named('next_pc');
+    // Next sequential PC (for not-taken branches and link address). The link
+    // (rd = return address) must be PC + instruction length: 2 for a compressed
+    // call (c.jalr), 4 for full-width. A fixed +4 returned two bytes past a
+    // c.jalr, corrupting every function-pointer/vtable call.
+    final nextPc =
+        (issuePc +
+                mux(
+                  issueIsCompressed,
+                  Const(2, width: xlen),
+                  Const(4, width: xlen),
+                ))
+            .named('next_pc');
 
     // Actual taken: unconditional jumps are always taken
     final actualTaken = (issueIsJump | branchTaken).named('actual_taken');

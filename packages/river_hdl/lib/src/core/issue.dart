@@ -129,6 +129,8 @@ class IssueQueue extends Module {
   Logic get dispatchBranchCondition => output('dispatch_branch_condition');
   Logic get dispatchBranchIsJump => output('dispatch_branch_is_jump');
   Logic get dispatchBranchIsJalr => output('dispatch_branch_is_jalr');
+  Logic get dispatchBranchIsCompressed =>
+      output('dispatch_branch_is_compressed');
 
   /// CSR dispatch.
   Logic get dispatchCsrValid => output('dispatch_csr_valid');
@@ -157,6 +159,7 @@ class IssueQueue extends Module {
     required Logic enqBranchCond0,
     required Logic enqIsJump0,
     required Logic enqIsJalr0,
+    required Logic enqIsCompressed0,
     required Logic enqUseImm0,
     required Logic enqCsrOp0,
     required Logic enqCsrAddr0,
@@ -177,6 +180,7 @@ class IssueQueue extends Module {
     required Logic enqBranchCond1,
     required Logic enqIsJump1,
     required Logic enqIsJalr1,
+    required Logic enqIsCompressed1,
     required Logic enqUseImm1,
     required Logic enqCsrOp1,
     required Logic enqCsrAddr1,
@@ -245,6 +249,7 @@ class IssueQueue extends Module {
     enqBranchCond0 = addInput('enq_branch_cond_0', enqBranchCond0, width: 3);
     enqIsJump0 = addInput('enq_is_jump_0', enqIsJump0);
     enqIsJalr0 = addInput('enq_is_jalr_0', enqIsJalr0);
+    enqIsCompressed0 = addInput('enq_is_compressed_0', enqIsCompressed0);
     enqUseImm0 = addInput('enq_use_imm_0', enqUseImm0);
     enqCsrOp0 = addInput('enq_csr_op_0', enqCsrOp0, width: 3);
     enqCsrAddr0 = addInput('enq_csr_addr_0', enqCsrAddr0, width: 12);
@@ -266,6 +271,7 @@ class IssueQueue extends Module {
     enqBranchCond1 = addInput('enq_branch_cond_1', enqBranchCond1, width: 3);
     enqIsJump1 = addInput('enq_is_jump_1', enqIsJump1);
     enqIsJalr1 = addInput('enq_is_jalr_1', enqIsJalr1);
+    enqIsCompressed1 = addInput('enq_is_compressed_1', enqIsCompressed1);
     enqUseImm1 = addInput('enq_use_imm_1', enqUseImm1);
     enqCsrOp1 = addInput('enq_csr_op_1', enqCsrOp1, width: 3);
     enqCsrAddr1 = addInput('enq_csr_addr_1', enqCsrAddr1, width: 12);
@@ -357,6 +363,7 @@ class IssueQueue extends Module {
     addOutput('dispatch_branch_condition', width: 3);
     addOutput('dispatch_branch_is_jump');
     addOutput('dispatch_branch_is_jalr');
+    addOutput('dispatch_branch_is_compressed');
 
     // Dispatch outputs, CSR
     addOutput('dispatch_csr_valid');
@@ -433,6 +440,10 @@ class IssueQueue extends Module {
     final entryIsJalr = List.generate(
       depth,
       (i) => Logic(name: 'iq_isjalr_$i'),
+    );
+    final entryIsCompressed = List.generate(
+      depth,
+      (i) => Logic(name: 'iq_iscompressed_$i'),
     );
     final entryUseImm = List.generate(
       depth,
@@ -800,6 +811,8 @@ class IssueQueue extends Module {
         muxField(entryBranchCond, dispBranchIdx);
     output('dispatch_branch_is_jump') <= muxField(entryIsJump, dispBranchIdx);
     output('dispatch_branch_is_jalr') <= muxField(entryIsJalr, dispBranchIdx);
+    output('dispatch_branch_is_compressed') <=
+        muxField(entryIsCompressed, dispBranchIdx);
 
     // Drive CSR dispatch outputs
     dispatchCsrValid <= dispCsrFound;
@@ -843,6 +856,7 @@ class IssueQueue extends Module {
           ...List.generate(depth, (i) => entryBranchCond[i] < 0),
           ...List.generate(depth, (i) => entryIsJump[i] < 0),
           ...List.generate(depth, (i) => entryIsJalr[i] < 0),
+          ...List.generate(depth, (i) => entryIsCompressed[i] < 0),
           ...List.generate(depth, (i) => entryUseImm[i] < 0),
           ...List.generate(depth, (i) => entryCsrOp[i] < 0),
           ...List.generate(depth, (i) => entryCsrAddr[i] < 0),
@@ -919,6 +933,7 @@ class IssueQueue extends Module {
                     entryBranchCond[i] < enqBranchCond0,
                     entryIsJump[i] < enqIsJump0,
                     entryIsJalr[i] < enqIsJalr0,
+                    entryIsCompressed[i] < enqIsCompressed0,
                     entryUseImm[i] < enqUseImm0,
                     entryCsrOp[i] < enqCsrOp0,
                     entryCsrAddr[i] < enqCsrAddr0,
@@ -953,6 +968,7 @@ class IssueQueue extends Module {
                     entryBranchCond[i] < enqBranchCond1,
                     entryIsJump[i] < enqIsJump1,
                     entryIsJalr[i] < enqIsJalr1,
+                    entryIsCompressed[i] < enqIsCompressed1,
                     entryUseImm[i] < enqUseImm1,
                     entryCsrOp[i] < enqCsrOp1,
                     entryCsrAddr[i] < enqCsrAddr1,

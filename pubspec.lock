@@ -126,7 +126,7 @@ packages:
     description:
       path: "packages/harbor"
       ref: "fix/arty-s7-ddr"
-      resolved-ref: cb646f8629d6b69a0e0e54bdf3171cfa0d48bbea
+      resolved-ref: "8783b4c7bfa2e7ee3acfc07432f4e869a59a312f"
       url: "https://github.com/MidstallSoftware/harbor.git"
     source: git
     version: "0.0.1"

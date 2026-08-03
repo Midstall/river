@@ -511,6 +511,7 @@ final List<MicroOpEncoding> kMicroOpTable = [
       'funct': BitRange(0, 4),
       'causeCode': BitRange(5, 10),
       'isInterrupt': BitRange(11, 11),
+      'modeCause': BitRange(12, 12),
     }),
     toMap: (mop) {
       final m = mop as RiscVTrapOp;
@@ -518,6 +519,7 @@ final List<MicroOpEncoding> kMicroOpTable = [
         'funct': TrapMicroOp.funct,
         'causeCode': m.causeCode,
         'isInterrupt': m.isInterrupt ? 1 : 0,
+        'modeCause': m.modeCause ? 1 : 0,
       };
     },
   ),
@@ -545,10 +547,17 @@ final List<MicroOpEncoding> kMicroOpTable = [
         5 + MicroOpLink.width + mxlen.size - 1,
       ),
     }),
-    toMap: (mop) => {
-      'funct': WriteLinkRegisterMicroOp.funct,
-      'link': MicroOpLink.rd.value,
-      'pcOffset': 4,
+    toMap: (mop) {
+      // pcOffset is the instruction length that forms the link (return) address
+      // = PC + len. It MUST come from the op, not a fixed 4: compressed calls
+      // (c.jalr, rv_c.dart) carry pcOffset: 2, and hardcoding 4 here returned
+      // two bytes too far, breaking every function-pointer/vtable call on rc1-s.
+      final m = mop as RiscVWriteLinkRegister;
+      return {
+        'funct': WriteLinkRegisterMicroOp.funct,
+        'link': MicroOpLink.rd.value,
+        'pcOffset': m.pcOffset,
+      };
     },
   ),
   MicroOpEncoding(
