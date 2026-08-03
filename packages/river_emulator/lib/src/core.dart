@@ -1017,9 +1017,9 @@ class RiverCore implements CsrContext {
           (t) => t.causeCode == mop.causeCode && t.interrupt == mop.isInterrupt,
           orElse: () => Trap.illegal,
         );
-        // ecall: microcode hardcodes cause 8 (ecallU); real cause depends on
-        // originating mode: U/VU=8, HS=9, VS=10 (H), M=11.
-        if (mop.causeCode == 8 && !mop.isInterrupt) {
+        // The micro-op's modeCause bit re-encodes the cause by originating
+        // mode (ecall: U/VU=8, HS=9, VS=10 (H), M=11), matching the RTL.
+        if (mop.modeCause && !mop.isInterrupt) {
           trapKind = switch (mode) {
             PrivilegeMode.machine => Trap.ecallM,
             PrivilegeMode.supervisor => virt ? Trap.ecallVS : Trap.ecallS,

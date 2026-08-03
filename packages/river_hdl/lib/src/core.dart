@@ -810,17 +810,38 @@ class RiverCore extends BridgeModule {
     dtlbFlushOnPriv <= (csrs == null ? Const(0) : csrs.rpipelinectl[3]);
 
     // Microcode ROMs (optionally PATCHABLE at runtime via the rmicrocode* CSRs).
-    final microcodeDecodeRead = DataPortInterface(
-      microcode.patternWidth,
-      microcode.map.length.bitLength,
-    );
+    // Parallel decode: the decode ROM packs `decodeLanes` pattern rows per word
+    // (lane 0 in the low bits) so the dynamic decoder reads + compares that many
+    // patterns per cycle, shortening its scan to ceil(patterns/lanes) cycles.
+    // lanes==1 is the classic one-per-cycle ROM.
+    final decodeLanes = config.microcodeDecodeLanes;
+    final patternW = microcode.patternWidth;
+    final decodeRowW = patternW * decodeLanes;
+    final decodeWords = (microcode.map.length + decodeLanes - 1) ~/ decodeLanes;
+    // Match the original count.bitLength convention (the RegisterFile/ROM index).
+    final decodeIdxW = decodeWords.bitLength;
+    // Pack: word w = pattern[w*lanes + l] << (l*patternW), padding the tail with
+    // the last real pattern (a never-false extra: if the instruction matched it
+    // the real lane matches first by priority, so no spurious hit).
+    final rawPatterns = microcode.encodedPatterns;
+    final packedPatterns = <BigInt>[
+      for (var w = 0; w < decodeWords; w++)
+        [
+          for (var l = 0; l < decodeLanes; l++)
+            rawPatterns[(w * decodeLanes + l).clamp(
+                  0,
+                  rawPatterns.length - 1,
+                )] <<
+                (l * patternW),
+        ].reduce((a, b) => a | b),
+    ];
+
+    final microcodeDecodeRead = DataPortInterface(decodeRowW, decodeIdxW);
     final microcodeExecRead = DataPortInterface(
       microcode.mopWidth(config.mxlen),
       microcode.mopIndexWidth(config.mxlen),
     );
 
-    final decodeRowW = microcode.patternWidth;
-    final decodeIdxW = microcode.map.length.bitLength;
     final execRowW = microcode.mopWidth(config.mxlen);
     final execIdxW = microcode.mopIndexWidth(config.mxlen);
 
@@ -894,7 +915,7 @@ class RiverCore extends BridgeModule {
       if (useEbrRom) {
         final rom = Ecp5InitRom(
           clk,
-          contents: microcode.encodedPatterns,
+          contents: packedPatterns,
           width: decodeRowW,
           rdAddr: microcodeDecodeRead.addr,
           wrEn: decodeWrite?.en,
@@ -908,7 +929,7 @@ class RiverCore extends BridgeModule {
         // the decode ROM does not explode into flops.
         final rom = InferredInitRom(
           clk,
-          contents: microcode.encodedPatterns,
+          contents: packedPatterns,
           width: decodeRowW,
           rdAddr: microcodeDecodeRead.addr,
           wrEn: decodeWrite?.en,
@@ -926,8 +947,8 @@ class RiverCore extends BridgeModule {
           reset,
           decodeWrite != null ? [wrapWriteForRegisterFile(decodeWrite)] : [],
           [wrapReadForRegisterFile(decodeRaw)],
-          numEntries: microcode.map.length,
-          resetValue: microcode.encodedPatterns,
+          numEntries: decodeWords,
+          resetValue: packedPatterns,
           definitionName: 'RiverMicrocodeLookup',
         );
         final decodeDataReg = Logic(

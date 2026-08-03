@@ -206,6 +206,17 @@ class RiverCoreConfig {
   final List<InterruptController> interrupts;
   final HarborMmuConfig mmu;
   final MicrocodeMode microcodeMode;
+
+  /// Number of microcode-decode LANES: how many decode-pattern ROM entries the
+  /// dynamic decoder reads + compares against the instruction PER CYCLE. The
+  /// decoder's pattern search is O(patterns/lanes) cycles, so `lanes` trades a
+  /// few comparators of area for a proportionally shorter decode (the pattern
+  /// scan is the dominant per-instruction cost on the microcode datapath). 1 =
+  /// the plain one-per-cycle linear scan. Larger cores set more lanes; the ROM
+  /// stays ROM-driven and runtime-patchable either way. No effect unless
+  /// [microcodeMode] uses a standalone (ROM-scanning) decoder.
+  final int microcodeDecodeLanes;
+
   final ExecutionMode executionMode;
   final IssueWidth issueWidth;
 
@@ -300,6 +311,7 @@ class RiverCoreConfig {
     required this.interrupts,
     required this.mmu,
     this.microcodeMode = MicrocodeMode.none,
+    this.microcodeDecodeLanes = 1,
     this.executionMode = ExecutionMode.inOrder,
     this.issueWidth = IssueWidth.single,
     IssueWidth? commitWidth,

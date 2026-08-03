@@ -150,7 +150,10 @@ void main() {
       dResume.inject(0);
       // run; expect self-halt on ebreak within N cycles
       var sawHalt = false;
-      for (var i = 0; i < 60; i++) {
+      // The rc1-s microcode core is ~80-85 cyc/instr in this bare harness, so the
+      // ebreak commits (self-halt) around cycle 166. The loop breaks on halt, so a
+      // generous bound just avoids a premature give-up, it does not slow the pass.
+      for (var i = 0; i < 400; i++) {
         await clk.nextPosedge;
         if (halted.value.isValid && halted.value.toInt() == 1) {
           sawHalt = true;

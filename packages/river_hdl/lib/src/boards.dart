@@ -40,6 +40,17 @@ class DdrBoard {
   /// clean). False for boards whose write eye closes on its own (ECP5/x16).
   final bool writeVerify;
 
+  /// Whether the controller runs hardware MPR read-calibration before opening
+  /// the bus (sequencer sweeps each byte lane's read window x IDELAY tap against
+  /// the DRAM MPR pattern and locks the eye). The openXC7 Arty ddr3Fast path
+  /// needs it: the CK-based ISERDESE2 capture eye drifts per boot, so a static
+  /// tap only boots ~half the time (the Ferrite first-ifetch coin-flip). False
+  /// for boards whose read eye is stable (ECP5 DQS-strobed capture).
+  final bool readLevel;
+
+  /// Post-read-cal cadence self-test gate (ddr3Fast). Requires [readLevel].
+  final bool selfTest;
+
   /// Per-board DDR tuning defaults, forwarded to the controller when a memory
   /// region does not override them (see genip's effective-value merge). Null
   /// leaves the genip global default in force. cmdSlot/wrShift/wrBeat/window
@@ -60,6 +71,8 @@ class DdrBoard {
     this.dqsComplementPins = const {},
     this.trainableRead = false,
     this.writeVerify = false,
+    this.readLevel = false,
+    this.selfTest = false,
     this.cmdSlot,
     this.wrShift,
     this.wrBeat,
@@ -122,9 +135,11 @@ class DdrBoard {
       colWidth: 10,
       casLatency: 6,
     ),
+    // Read-cal PARKED OFF (see _artyS7x8): wedges the boot on HW.
+    readLevel: false,
     pins: {
-      'sdram_ck': 'R5 SSTL135',
-      'sdram_ck_n': 'T4 SSTL135',
+      'sdram_ck': 'R5 DIFF_SSTL135',
+      'sdram_ck_n': 'T4 DIFF_SSTL135',
       'sdram_cke': 'T2 SSTL135',
       'sdram_cs_n': 'R3 SSTL135',
       'sdram_ras_n': 'U1 SSTL135',
@@ -202,6 +217,11 @@ class DdrBoard {
     // 90-degree phase inert): reads clean, a re-driven write always lands, so
     // write-verify-retry makes CPU writes correct.
     writeVerify: true,
+    // Read-cal (MPR eye sweep) is PARKED OFF: on HW the sRdCal FSM does not
+    // complete (sim-clean, unsimmable on the real PHY), so its bus gate wedges
+    // the whole wishbone before the FSBL prints. The RTL stays behind the flag
+    // (readlevel=true) for on-board debugging; the default boot is the base.
+    readLevel: false,
     // HW-proven x8 DDR3 tuning, baked in so a plain build needs no per-region params.
     cmdSlot: 2,
     wrShift: -1,
@@ -210,8 +230,8 @@ class DdrBoard {
     readRetry: 6,
     window: 5,
     pins: {
-      'sdram_ck': 'R5 SSTL135',
-      'sdram_ck_n': 'T4 SSTL135',
+      'sdram_ck': 'R5 DIFF_SSTL135',
+      'sdram_ck_n': 'T4 DIFF_SSTL135',
       'sdram_cke': 'T2 SSTL135',
       'sdram_cs_n': 'R3 SSTL135',
       'sdram_ras_n': 'U1 SSTL135',
@@ -270,6 +290,8 @@ class DdrBoard {
       casLatency: 6,
     ),
     writeVerify: true,
+    // Read-cal PARKED OFF (see _artyS7x8): wedges the boot on HW.
+    readLevel: false,
     cmdSlot: 2,
     wrShift: -1,
     wrBeat: 0,
@@ -277,8 +299,8 @@ class DdrBoard {
     readRetry: 6,
     window: 5,
     pins: {
-      'sdram_ck': 'R5 SSTL135',
-      'sdram_ck_n': 'T4 SSTL135',
+      'sdram_ck': 'R5 DIFF_SSTL135',
+      'sdram_ck_n': 'T4 DIFF_SSTL135',
       'sdram_cke': 'T2 SSTL135',
       'sdram_cs_n': 'R3 SSTL135',
       'sdram_ras_n': 'U1 SSTL135',

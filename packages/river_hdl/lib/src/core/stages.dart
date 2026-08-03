@@ -135,6 +135,10 @@ const kIsJump = HarborPayload('IS_JUMP');
 /// Register-indirect jump target (jalr).
 const kIsJalr = HarborPayload('IS_JALR');
 
+/// The fetched instruction was a 2-byte compressed (RVC) op. Needed so the
+/// branch unit forms the JAL/JALR link as PC+2, not PC+4.
+const kIsCompressed = HarborPayload('IS_COMPRESSED');
+
 /// ALU second operand is the immediate (I-type).
 const kUseImm = HarborPayload('USE_IMM');
 
@@ -189,6 +193,7 @@ const kAluFunct1 = HarborPayload('ALU_FUNCT_1', width: 7);
 const kBranchCond1 = HarborPayload('BRANCH_COND_1', width: 3);
 const kIsJump1 = HarborPayload('IS_JUMP_1');
 const kIsJalr1 = HarborPayload('IS_JALR_1');
+const kIsCompressed1 = HarborPayload('IS_COMPRESSED_1');
 const kUseImm1 = HarborPayload('USE_IMM_1');
 const kSignExtend1 = HarborPayload('SIGN_EXTEND_1');
 

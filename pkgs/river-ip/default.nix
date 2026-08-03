@@ -83,7 +83,9 @@ lib.extendMkDerivation {
       deviceFlags = lib.concatMapStringsSep " " (d: "--device ${d}") devices;
       targetFlag = lib.optionalString (target != null) "--target ${target}";
       pdkRootFlag = lib.optionalString (pdkRoot != null) "--pdk-root ${pdkRoot}";
-      pinFlags = lib.concatMapStringsSep " " (p: "--pin ${p}") pins;
+      # Quote each pin: a spec may carry a space-separated IOSTANDARD/attr
+      # (e.g. "clk=R2 SSTL135"), which must reach genip as ONE --pin argument.
+      pinFlags = lib.concatMapStringsSep " " (p: "--pin '${p}'") pins;
       bootProgramFlag = lib.optionalString (bootProgram != null) "--boot-program ${bootProgram}";
     in
     builtins.removeAttrs args [
