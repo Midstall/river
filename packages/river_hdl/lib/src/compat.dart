@@ -188,6 +188,14 @@ class MicroOpAluFunct {
   static const int remw = 26;
   static const int remuw = 27;
   static const int masked = 28;
+  // Zbb min/max (RiscVAluFunct enum indices). rc1-f has no Zbb so the ROM never
+  // emits these, but the shared ALU implements them (reusing slt/sltu) so the
+  // AMO read-modify-write combine can route min/max/minu/maxu through this ONE
+  // unit instead of a dedicated 9-way afunct mux.
+  static const int minOp = 31;
+  static const int maxOp = 32;
+  static const int minuOp = 33;
+  static const int maxuOp = 34;
   // Zicond: conditional-zero. Values are the RiscVAluFunct enum indices (the
   // funct stored in the microcode ROM), not a dense local numbering.
   static const int czeroEqz = 61;

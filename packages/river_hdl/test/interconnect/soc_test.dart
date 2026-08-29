@@ -32,7 +32,7 @@ void main() {
 
       final generator = HarborDeviceTreeGenerator(
         model: 'Stream V1',
-        compatible: 'midstall,stream-v1',
+        compatible: 'lilithsemi,stream-v1',
         cpus: cpus,
       );
 
@@ -74,7 +74,7 @@ void main() {
 
       final generator = HarborDeviceTreeGenerator(
         model: 'Creek V1',
-        compatible: 'midstall,creek-v1',
+        compatible: 'lilithsemi,creek-v1',
         cpus: cpus,
       );
 

@@ -44,6 +44,14 @@ class RiverMaskromConfig {
   /// poll until an image lands in RAM, jump to the reported entry. Skips the copy.
   final RiverDfuConfig? dfu;
 
+  /// Optional boot banner. When [bootMessage] and [uartBase] are both set, the
+  /// maskrom brings up the UART and prints the banner before handing off (the
+  /// xipLaunch path prints it just before jumping to the FSBL). [uartDivisor] is
+  /// the ns16550a baud divisor (uart clock / baud).
+  final String? bootMessage;
+  final int? uartBase;
+  final int uartDivisor;
+
   const RiverMaskromConfig({
     required this.isa,
     required this.resetVector,
@@ -53,12 +61,18 @@ class RiverMaskromConfig {
     required this.stackTop,
     this.bootMode = RiverBootMode.sram,
     this.dfu,
+    this.bootMessage,
+    this.uartBase,
+    this.uartDivisor = 1,
   });
 }
 
 class RiverMaskrom extends Module {
   @override
   final RiscVIsaConfig isa;
+
+  /// Unique-label counter for the banner's per-character TX-wait loops.
+  int _uid = 0;
 
   RiverMaskrom(RiverMaskromConfig config) : isa = config.isa {
     register(Register.x2).bind(li(config.stackTop));
@@ -76,6 +90,9 @@ class RiverMaskrom extends Module {
       // No copy: warm up the flash XIP controller, then jump to the FSBL running
       // in place. flashSource = warmup read window; copyDest = FSBL entry.
       _warmupRead(config.flashSource, config.copySize);
+      if (config.bootMessage != null && config.uartBase != null) {
+        _emitBanner(config.bootMessage!, config.uartBase!, config.uartDivisor);
+      }
       fence();
       register(Register.x10).bind(li(0)); // a0 = hartid (boot hart)
       register(
@@ -156,6 +173,33 @@ class RiverMaskrom extends Module {
     register(Register.x15).bind(lw(register(Register.x10)));
     register(Register.x10).bind(addi(register(Register.x10), 4));
     bne(register(Register.x10), register(Register.x12), loop);
+  }
+
+  /// Bring up the ns16550a UART (8N1, [divisor] baud divisor) and print
+  /// [msg] as a boot banner. x13 holds the UART base throughout; each byte
+  /// polls THRE (LSR bit 5) before it writes THR. The banner is fire-and-forget:
+  /// nothing here is read back, so it never blocks the handoff to the FSBL.
+  void _emitBanner(String msg, int uartBase, int divisor) {
+    final div = divisor.clamp(1, 0xffff);
+    register(Register.x13).bind(li(uartBase));
+    register(Register.x11).bind(li(0x83)); // LCR: DLAB=1, 8N1
+    sb(register(Register.x13), register(Register.x11), offset: 3);
+    register(Register.x11).bind(li(div & 0xff));
+    sb(register(Register.x13), register(Register.x11), offset: 0);
+    register(Register.x11).bind(li((div >> 8) & 0xff));
+    sb(register(Register.x13), register(Register.x11), offset: 1);
+    register(Register.x11).bind(li(0x03)); // LCR: DLAB=0, 8N1
+    sb(register(Register.x13), register(Register.x11), offset: 3);
+
+    register(Register.x13).bind(li(uartBase));
+    for (final c in msg.codeUnits) {
+      final wait = label('mrtx_${_uid++}');
+      final lsr = lbu(register(Register.x13), offset: 5);
+      register(Register.x14).bind(andi(lsr, 0x20));
+      beq(register(Register.x14), register(Register.x0), wait);
+      register(Register.x11).bind(li(c));
+      sb(register(Register.x13), register(Register.x11));
+    }
   }
 
   void _copyLoop(int src, int dst, int size) {

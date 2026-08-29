@@ -53,7 +53,7 @@ Future<void> main(List<String> arguments) async {
       abbr: 'c',
       help: 'Core model',
       defaultsTo: ['rc1-mi'],
-      allowed: ['rc1-n', 'rc1-mi', 'rc1-s', 'rc1-m'],
+      allowed: ['rc1-n', 'rc1-mi', 'rc1-s', 'rc1-m', 'rc1-f'],
     )
     ..addOption(
       'clock-freq',

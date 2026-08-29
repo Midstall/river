@@ -300,6 +300,32 @@ class DynamicInstructionDecoder extends InstructionDecoder {
   /// instruction re-searches fresh.
   late final Logic _held;
 
+  /// Decode is pipelined into two registered stages to cut the critical path
+  /// (which was instr -> match cone -> wide field-select Cases -> output regs,
+  /// 91% routing on the xc7s50). Stage 1 (the ROM search) latches ONLY the
+  /// match result into these registers; stage 2 drives the wide `type`/`opIndex`
+  /// field Cases from the REGISTERED opIndex/type, so the second cone is short
+  /// and local and `instr` is no longer its select. Costs one extra decode
+  /// cycle, negligible at ~67 CPI, and absorbed by the exec unit's existing
+  /// tolerance for variable decode latency (the ROM search is already variable).
+  late final Logic _matchedStage;
+  late final Logic _matchOpIndex;
+  late final Logic _matchType;
+  late final Logic _matchInstr;
+
+  /// Armed the first time the ROM search reaches the zero-filled tail (mask==0)
+  /// with no match, to force ONE restart from index 0 before declaring illegal.
+  /// The scan counter is meant to start at 0 for each instruction (reset on
+  /// match, and at the enable-drop commit boundary), but at a jump/redirect the
+  /// next instruction can be fetched back-to-back and start its search from the
+  /// STALE counter, skip its own (earlier) pattern, and hit the tail. Restarting
+  /// once from 0 lets a valid instruction match on the clean pass; only a
+  /// genuine illegal reaches the tail again after a full 0-based scan. This is
+  /// the robust guard that the counter-reset alone did not cover (seen on HW as
+  /// an illegal trap on the `auipc` jalr-return targets in Linux's _start_kernel
+  /// call sequences). Cleared on a match and at the decode boundary (reset()).
+  late final Logic _rescanned;
+
   DynamicInstructionDecoder(
     super.clk,
     super.reset,
@@ -321,10 +347,26 @@ class DynamicInstructionDecoder extends InstructionDecoder {
       width: microcode.decodeLookup.length.bitLength,
     );
     _held = Logic(name: 'held');
+    _matchedStage = Logic(name: 'matchedStage');
+    _rescanned = Logic(name: 'rescanned');
+    _matchOpIndex = Logic(name: 'matchOpIndex', width: microcode.opIndexWidth);
+    _matchType = Logic(
+      name: 'matchType',
+      width: microcode.typeStructs.length.bitLength,
+    );
+    _matchInstr = Logic(name: 'matchInstr', width: 32);
   }
 
   @override
-  List<Conditional> reset() => [_counter < 0, _held < 0];
+  List<Conditional> reset() => [
+    _counter < 0,
+    _held < 0,
+    _matchedStage < 0,
+    _rescanned < 0,
+    _matchOpIndex < 0,
+    _matchType < 0,
+    _matchInstr < 0,
+  ];
 
   @override
   List<Conditional> decodeMicrocode(
@@ -424,6 +466,71 @@ class DynamicInstructionDecoder extends InstructionDecoder {
         .eq(pattern['value']!)
         .named('patternMatch');
 
+    // STAGE 2 field extraction, sourced from the REGISTERED match result. This
+    // is the identical field logic as before, just driven by _matchInstr /
+    // _matchType / _matchOpIndex so this cone launches from compact local
+    // registers instead of the 32-bit `instr` + the match cone. A function so
+    // each use gets fresh Conditionals (ROHD nodes cannot be shared).
+    List<Conditional> computeFields() => [
+      _held < 1,
+      _matchedStage < 0,
+      index < _matchOpIndex.zeroExtend(index.width),
+      ...fields.entries.map((entry) => entry.value < 0),
+      ...instrTypeMap.entries.map((entry) => entry.value < 0),
+      Case(_matchType, [
+        for (final e in instrTypeMap.entries.indexed)
+          CaseItem(Const(e.$1, width: instrTypeMap.length.bitLength), [
+            e.$2.value < 1,
+            done < 1,
+            valid < 1,
+            ...microcode.typeStructs[e.$2.key]!.fields.entries
+                .where((entry) => entry.key != 'imm')
+                .map((entry) {
+                  final fieldName = entry.key;
+                  final fieldOutput = fields[fieldName]!;
+                  final range = entry.value;
+                  final extracted = _matchInstr.slice(range.end, range.start);
+                  final value = extracted.width <= fieldOutput.width
+                      ? extracted.zeroExtend(fieldOutput.width)
+                      : extracted.slice(fieldOutput.width - 1, 0);
+                  return fieldOutput < value.named(fieldName);
+                }),
+            fields['imm']! < decodeImm(e.$2.key, _matchInstr),
+          ]),
+      ]),
+      // Per-op override: implicit fixed registers + RVC immediate descramble,
+      // keyed on the matched opIndex (later so it wins). Also re-sourced.
+      if (overrideOps.isNotEmpty)
+        Case(_matchOpIndex, [
+          for (final e in overrideOps)
+            CaseItem(Const(e.key, width: opIdxWidth), [
+              fields['rd']! < compReg(e.value, _matchInstr, 'rd'),
+              fields['rs1']! < compReg(e.value, _matchInstr, 'rs1'),
+              fields['rs2']! < compReg(e.value, _matchInstr, 'rs2'),
+              fields['imm']! < immFor(e.value, _matchInstr),
+            ]),
+        ]),
+    ];
+
+    // "No valid decode this cycle" output clear (fresh Conditionals each call).
+    List<Conditional> clearOutputs() => [
+      done < 0,
+      valid < 0,
+      index < 0,
+      ...instrTypeMap.entries.map((entry) => entry.value < 0),
+      ...fields.entries.map((entry) => entry.value < 0),
+    ];
+
+    // First cycle of a NEW instruction: the fetch holds `pc_in` stable across the
+    // multi-cycle scan, so `pc_in != pc_out` (pc_out is last cycle's pc_in) is
+    // high for exactly the first scan cycle. On that cycle we restart the ROM
+    // scan at row 0 COMBINATIONALLY, so a jump/redirect (e.g. a jalr return
+    // target fetched back-to-back with enable still high) can never inherit the
+    // previous instruction's stale scan index. This is the timing-independent
+    // form of the counter-reset: the register reset alone fixes only next cycle's
+    // address, which loses the race on HW under real fetch latency.
+    final newInstr = input('pc_in').neq(pcOut).named('decodeNewInstr');
+
     return [
       If(
         _held,
@@ -432,96 +539,138 @@ class DynamicInstructionDecoder extends InstructionDecoder {
         // reset() at the commit boundary.
         then: [microcodeRead.en < 0, done < 1, valid < 1],
         orElse: [
-          microcodeRead.en < 1,
-          // _counter is sized for the unpacked pattern count; the packed ROM has
-          // ceil(patterns/lanes) words, so its address port is narrower.
-          microcodeRead.addr < _counter.getRange(0, microcodeRead.addr.width),
           If(
-            microcodeRead.done,
-            then: [
-              If(
-                microcodeRead.valid,
-                then: [
-                  If(
-                    patternMatch & nzfMatch & zfMatch,
-                    then: [
-                      _held < 1,
-                      index < pattern['opIndex']!.zeroExtend(index.width),
-                      ...fields.entries.map((entry) => entry.value < 0),
-                      ...instrTypeMap.entries.map((entry) => entry.value < 0),
-                      Case(pattern['type']!, [
-                        for (final e in instrTypeMap.entries.indexed)
-                          CaseItem(
-                            Const(e.$1, width: instrTypeMap.length.bitLength),
-                            [
-                              e.$2.value < 1,
-                              done < 1,
-                              valid < 1,
-                              ...microcode.typeStructs[e.$2.key]!.fields.entries
-                                  .where((entry) => entry.key != 'imm')
-                                  .map((entry) {
-                                    final fieldName = entry.key;
-                                    final fieldOutput = fields[fieldName]!;
-                                    final range = entry.value;
-                                    final extracted = instr.slice(
-                                      range.end,
-                                      range.start,
-                                    );
-                                    final value =
-                                        extracted.width <= fieldOutput.width
-                                        ? extracted.zeroExtend(
-                                            fieldOutput.width,
-                                          )
-                                        : extracted.slice(
-                                            fieldOutput.width - 1,
-                                            0,
-                                          );
-                                    return fieldOutput < value.named(fieldName);
-                                  }),
-                              fields['imm']! < decodeImm(e.$2.key, instr),
-                            ],
-                          ),
-                      ]),
-                      // Per-op override: apply implicit fixed registers and the RVC
-                      // immediate descramble for compressed ops (the type-based
-                      // extraction above is blind to op.fixedRs1 etc. and op.immKind).
-                      // Keyed on the matched opIndex, later in the list so it wins.
-                      if (overrideOps.isNotEmpty)
-                        Case(pattern['opIndex']!, [
-                          for (final e in overrideOps)
-                            CaseItem(Const(e.key, width: opIdxWidth), [
-                              fields['rd']! < compReg(e.value, instr, 'rd'),
-                              fields['rs1']! < compReg(e.value, instr, 'rs1'),
-                              fields['rs2']! < compReg(e.value, instr, 'rs2'),
-                              fields['imm']! < immFor(e.value, instr),
-                            ]),
-                        ]),
-                    ],
-                    orElse: [
-                      _counter < (_counter + 1),
-                      done < 0,
-                      valid < 0,
-                      index < 0,
-                      ...instrTypeMap.entries.map((entry) => entry.value < 0),
-                      ...fields.entries.map((entry) => entry.value < 0),
-                    ],
+            _matchedStage,
+            // STAGE 2: the ROM search matched last cycle. Drive the wide field
+            // Cases off the registered opIndex/type/instr (a short, local cone)
+            // and hand off. No ROM access this cycle.
+            then: [microcodeRead.en < 0, ...computeFields()],
+            orElse: [
+              // STAGE 1: search the microcode ROM, one packed row per cycle.
+              microcodeRead.en < 1,
+              // _counter is sized for the unpacked pattern count; the packed ROM
+              // has ceil(patterns/lanes) words, so its address port is narrower.
+              // On a new instruction, force the read address to row 0 THIS cycle.
+              microcodeRead.addr <
+                  mux(
+                    newInstr,
+                    Const(0, width: microcodeRead.addr.width),
+                    _counter.getRange(0, microcodeRead.addr.width),
                   ),
+              If(
+                newInstr,
+                // Fresh instruction: this cycle's ROM output is still the prior
+                // address (read latency 1), so ignore it. We prefetch row 0 now
+                // (address above) and set the counter so row 1 is prefetched next
+                // cycle; the scan then proceeds 0,1,2,... from a clean start.
+                then: [
+                  _counter < Const(1, width: _counter.width),
+                  _rescanned < 0,
+                  ...clearOutputs(),
                 ],
                 orElse: [
-                  done < 1,
-                  valid < 0,
-                  index < 0,
-                  ...instrTypeMap.entries.map((entry) => entry.value < 0),
-                  ...fields.entries.map((entry) => entry.value < 0),
+                  If(
+                    microcodeRead.done,
+                    then: [
+                      If(
+                        microcodeRead.valid,
+                        then: [
+                          If(
+                            patternMatch &
+                                nzfMatch &
+                                zfMatch &
+                                pattern['mask']!.neq(0),
+                            // Match: latch ONLY the result; the field Cases run next
+                            // cycle in stage 2. done/valid stay low until then. Exec
+                            // already tolerates variable decode latency (the ROM
+                            // search length itself varies). mask!=0 excludes the
+                            // all-zero tail entries (see the end-of-ROM check below).
+                            then: [
+                              _matchedStage < 1,
+                              // Reset the ROM scan counter to 0 on every match so the
+                              // NEXT instruction searches from index 0. The search
+                              // otherwise stops AT the match index, and the
+                              // decode-boundary reset (on `enable` dropping) does not
+                              // always fire when the next instruction is fetched
+                              // back-to-back at a jump/redirect (e.g. a jalr return
+                              // target). Without this, that next instruction searches
+                              // from the stale match index, skips its own (earlier)
+                              // pattern, runs into the zero tail, and asserts a
+                              // SPURIOUS illegal-instruction trap on a perfectly valid
+                              // instruction. Seen on HW as an illegal trap on the
+                              // `auipc` return targets in Linux's _start_kernel
+                              // call sequences after the MMU is enabled.
+                              _counter < 0,
+                              _rescanned < 0,
+                              _matchOpIndex < pattern['opIndex']!,
+                              _matchType < pattern['type']!,
+                              _matchInstr < instr,
+                              done < 0,
+                              valid < 0,
+                            ],
+                            orElse: [
+                              If(
+                                pattern['mask']!.eq(0),
+                                // Reached the zero-filled tail past the last real
+                                // pattern with no match this whole (0-based) pass: the
+                                // ROM read stays "valid" beyond the encoded patterns
+                                // and returns all-zero words (the ROM zero-pads to its
+                                // power-of-two depth). A zero pattern has mask 0 and
+                                // would spuriously match EVERY instruction as op 0; no
+                                // real op has mask 0 (each constrains its opcode).
+                                // On the FIRST tail hit, restart the search from index
+                                // 0 (arm _rescanned) instead of declaring illegal: the
+                                // counter may have started stale at a jump/redirect
+                                // (e.g. a jalr return target) and skipped this
+                                // instruction's real pattern. A valid instruction
+                                // matches on the clean 0-based pass. Only the SECOND
+                                // tail hit (after a full 0-based scan found nothing,
+                                // _rescanned set) is a genuine end-of-ROM -> assert
+                                // illegal (done=1, valid=0).
+                                then: [
+                                  If(
+                                    _rescanned,
+                                    then: [
+                                      done < 1,
+                                      valid < 0,
+                                      index < 0,
+                                      ...instrTypeMap.entries.map(
+                                        (entry) => entry.value < 0,
+                                      ),
+                                      ...fields.entries.map(
+                                        (entry) => entry.value < 0,
+                                      ),
+                                    ],
+                                    orElse: [
+                                      _counter < 0,
+                                      _rescanned < 1,
+                                      ...clearOutputs(),
+                                    ],
+                                  ),
+                                ],
+                                orElse: [
+                                  _counter < (_counter + 1),
+                                  ...clearOutputs(),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ],
+                        orElse: [
+                          done < 1,
+                          valid < 0,
+                          index < 0,
+                          ...instrTypeMap.entries.map(
+                            (entry) => entry.value < 0,
+                          ),
+                          ...fields.entries.map((entry) => entry.value < 0),
+                        ],
+                      ),
+                    ],
+                    orElse: clearOutputs(),
+                  ),
                 ],
               ),
-            ],
-            orElse: [
-              done < 0,
-              valid < 0,
-              index < 0,
-              ...instrTypeMap.entries.map((entry) => entry.value < 0),
-              ...fields.entries.map((entry) => entry.value < 0),
             ],
           ),
         ],

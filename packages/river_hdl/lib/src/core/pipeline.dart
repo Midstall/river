@@ -39,6 +39,7 @@ class RiverPipeline extends Module {
   Logic get nextMode => output('nextMode');
   Logic get trap => output('trap');
   Logic get trapCause => output('trapCause');
+  Logic get trapInterrupt => output('trapInterrupt');
   Logic get trapTval => output('trapTval');
   Logic get trapEpc => output('trapEpc');
   Logic get isReturn => output('isReturn');
@@ -93,6 +94,8 @@ class RiverPipeline extends Module {
     Logic? medeleg,
     Logic? mtvec,
     Logic? stvec,
+    Logic? interruptTake,
+    Logic? interruptCause,
     // mret/sret return targets (for the OoO commit-stage fetcher redirect).
     Logic? mepc,
     Logic? sepc,
@@ -276,6 +279,10 @@ class RiverPipeline extends Module {
     }
     if (mtvec != null) mtvec = addInput('mtvec', mtvec, width: mxlen.size);
     if (stvec != null) stvec = addInput('stvec', stvec, width: mxlen.size);
+    if (interruptTake != null) {
+      interruptTake = addInput('interruptTake', interruptTake);
+      interruptCause = addInput('interruptCause', interruptCause!, width: 6);
+    }
     if (mepc != null) mepc = addInput('mepc', mepc, width: mxlen.size);
     if (sepc != null) sepc = addInput('sepc', sepc, width: mxlen.size);
     final prfSeedEnIn = prfSeedEn == null
@@ -315,6 +322,7 @@ class RiverPipeline extends Module {
     addOutput('nextMode', width: 3);
     addOutput('trap');
     addOutput('trapCause', width: 6);
+    addOutput('trapInterrupt');
     addOutput('trapTval', width: mxlen.size);
     addOutput('trapEpc', width: mxlen.size);
     addOutput('isReturn');
@@ -381,6 +389,7 @@ class RiverPipeline extends Module {
         redirectPc: fetchRedirectPc,
         consume0: bufConsume0,
         consume1: bufConsume1,
+        fault: ifetchFaultIn,
         depth: prefetchDepth < 4 ? 4 : prefetchDepth,
       );
       fetcher = cfb;
@@ -448,12 +457,15 @@ class RiverPipeline extends Module {
       fetchOutPc = fetcher.output('pc_out');
     }
 
-    // The fetch-fault marker (FetchUnit only; the prefetch/dual fetchers do not
-    // carry fetch faults yet). Used to raise an instruction page fault.
+    // The fetch-fault marker. The plain FetchUnit and the compressed fetch buffer
+    // carry fetch faults (delivered as a bubble that exec turns into an
+    // instruction page fault); the prefetch/pipelined fetchers do not yet.
     final usePlainFetchUnit =
         !useCompressedFetch && !usePrefetch && !usePipelined;
     final fetchFaultSig = usePlainFetchUnit
         ? fetcher.output('fetch_fault')
+        : useCompressedFetch
+        ? cfb!.fetchFault
         : Const(0);
 
     // Helper: resize signal to target width (truncate or zero-extend)
@@ -551,6 +563,8 @@ class RiverPipeline extends Module {
               medeleg: medeleg,
               mtvec: mtvec,
               stvec: stvec,
+              interruptTake: interruptTake,
+              interruptCause: interruptCause,
               virtIn: virt,
               mstateen0Se0: mstateen0Se0,
               hstateen0Se0: hstateen0Se0,
@@ -585,6 +599,8 @@ class RiverPipeline extends Module {
               medeleg: medeleg,
               mtvec: mtvec,
               stvec: stvec,
+              interruptTake: interruptTake,
+              interruptCause: interruptCause,
               virtIn: virt,
               mstateen0Se0: mstateen0Se0,
               hstateen0Se0: hstateen0Se0,
@@ -597,9 +613,53 @@ class RiverPipeline extends Module {
       final execDone = exec.done;
       final execValid = exec.valid;
 
+      // Illegal-instruction detection is the pipeline's responsibility, not the
+      // exec unit's: a fetched instruction whose decode finished with no
+      // matching operation (decodeDone & ~decodeValid) is a reserved or
+      // unimplemented encoding, e.g. the all-zero 0x0000 a jump into cleared
+      // memory lands on. The pipeline asserts the illegal-instruction exception
+      // here so the core faults at once instead of silently advancing past it
+      // (which let a bad PC sled forward through zeroed memory).
+      final decodeIllegal =
+          (fetchOutValid & fetchOutDone & decodeDone & ~decodeValid).named(
+            'decodeIllegal',
+          );
+      final illegalCause = Const(2, width: 6); // illegal instruction
+      final illegalIsIntr = Const(0);
+      final Logic illegalTrapMode;
+      final Logic illegalTrapPc;
+      if (mtvec != null) {
+        illegalTrapMode = selectTrapTargetModeTop(
+          illegalIsIntr,
+          illegalCause,
+          currentMode,
+          mideleg,
+          medeleg,
+          hasCsr: csrRead != null && csrWrite != null,
+          hasSupervisor: hasSupervisor,
+        ).named('illegalTrapMode');
+        final tvec = stvec != null
+            ? mux(
+                illegalTrapMode.eq(Const(PrivilegeMode.machine.id, width: 3)),
+                mtvec,
+                stvec,
+              )
+            : mtvec;
+        illegalTrapPc = computeTrapVectorPcTop(
+          tvec,
+          illegalCause,
+          illegalIsIntr,
+          mxlen,
+          suffix: 'Illegal',
+        );
+      } else {
+        illegalTrapMode = currentMode;
+        illegalTrapPc = currentPc;
+      }
+
       Sequential(clk, [
         If(
-          reset | ~execDone,
+          reset | (~execDone & ~decodeIllegal),
           then: [
             done < 0,
             valid < 0,
@@ -608,6 +668,7 @@ class RiverPipeline extends Module {
             nextMode < 0,
             trap < 0,
             trapCause < 0,
+            trapInterrupt < 0,
             trapTval < 0,
             trapEpc < 0,
             isReturn < 0,
@@ -616,20 +677,46 @@ class RiverPipeline extends Module {
             counter < 0,
           ],
           orElse: [
-            done < fetchOutDone & decodeDone & execDone,
-            valid < fetchOutValid & decodeValid & execValid,
-            nextSp < exec.nextSp,
-            nextPc < exec.nextPc,
-            nextMode < exec.nextMode,
-            trap < exec.trap,
-            trapCause < exec.trapCause,
-            trapTval < exec.trapTval,
-            trapEpc < exec.trapEpc,
-            isReturn < exec.isReturn,
-            returnLevel < exec.returnLevel,
-            fence < exec.fence,
-            interruptHold < exec.interruptHold,
-            If(enable, then: [counter < (counter + 1)]),
+            If(
+              decodeIllegal,
+              // Decode matched nothing: commit an illegal-instruction trap
+              // (cause 2) at the faulting PC. exec never ran for this cycle, so
+              // these outputs come straight from the pipeline.
+              then: [
+                done < 1,
+                valid < 1,
+                nextSp < currentSp,
+                nextPc < illegalTrapPc,
+                nextMode < illegalTrapMode,
+                trap < 1,
+                trapCause < illegalCause,
+                trapInterrupt < 0,
+                trapTval < 0,
+                trapEpc < currentPc,
+                isReturn < 0,
+                returnLevel < 0,
+                fence < 0,
+                interruptHold < 0,
+                If(enable, then: [counter < (counter + 1)]),
+              ],
+              orElse: [
+                done < fetchOutDone & decodeDone & execDone,
+                valid < fetchOutValid & decodeValid & execValid,
+                nextSp < exec.nextSp,
+                nextPc < exec.nextPc,
+                nextMode < exec.nextMode,
+                trap < exec.trap,
+                trapCause < exec.trapCause,
+                trapInterrupt < exec.trapInterrupt,
+                trapTval < exec.trapTval,
+                trapEpc < exec.trapEpc,
+                isReturn < exec.isReturn,
+                returnLevel < exec.returnLevel,
+                fence < exec.fence,
+                interruptHold < exec.interruptHold,
+                If(enable, then: [counter < (counter + 1)]),
+              ],
+            ),
           ],
         ),
       ]);
@@ -2168,6 +2255,7 @@ class RiverPipeline extends Module {
             nextMode < 0,
             trap < 0,
             trapCause < 0,
+            trapInterrupt < 0,
             trapTval < 0,
             trapEpc < 0,
             isReturn < 0,
@@ -2210,6 +2298,9 @@ class RiverPipeline extends Module {
             // Trap from ROB commit
             trap < (rob.commitValid0 & rob.commitException0),
             trapCause < rob.commitCause0,
+            // OoO path takes no async interrupts yet; ROB commits only
+            // synchronous exceptions.
+            trapInterrupt < 0,
             trapTval < Const(0, width: mxlen.size),
             trapEpc < rob.commitPc0,
             // Privileged return (mret/sret): core.dart restores pc<-{m,s}epc and

@@ -10,12 +10,28 @@
       url = "github:numtide/treefmt-nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    # PDKs (sky130, gf180mcu) + the silicon backend (mkTapeout/mkVerify).
     asix = {
-      url = "github:MidstallSoftware/asix";
+      url = "git+https://git.lilithsemi.com/LilithSemi/asix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     openxc7.url = "github:openXC7/toolchain-nix";
+    weir = {
+      url = "git+https://git.lilithsemi.com/LilithSemi/weir";
+      inputs = {
+        nixpkgs.follows = "nixpkgs";
+        flake-parts.follows = "flake-parts";
+        flakever.follows = "flakever";
+        treefmt-nix.follows = "treefmt-nix";
+      };
+    };
+    harbor = {
+      url = "git+https://git.lilithsemi.com/LilithSemi/harbor";
+      inputs = {
+        nixpkgs.follows = "nixpkgs";
+        flakever.follows = "flakever";
+        treefmt-nix.follows = "treefmt-nix";
+      };
+    };
   };
 
   outputs =
@@ -25,6 +41,8 @@
       flake-parts,
       flakever,
       treefmt-nix,
+      weir,
+      harbor,
       ...
     }@inputs:
     let
@@ -44,7 +62,10 @@
         inputs.treefmt-nix.flakeModule
       ];
 
-      flake.versionTemplate = "1.1pre-<lastModifiedDate>-<rev>";
+      flake = {
+        versionTemplate = "1.1pre-<lastModifiedDate>-<rev>";
+        nixosModules.default = ./nix/module.nix;
+      };
 
       systems = [
         "aarch64-linux"
@@ -105,6 +126,8 @@
             inherit system;
             overlays = [
               inputs.asix.overlays.default
+              inputs.weir.overlays.default
+              inputs.harbor.overlays.default
               self.overlays.default
             ];
           };
@@ -184,6 +207,42 @@
               isFpga = ip: builtins.elem (targetVendor ip) fpgaVendors;
               isAsic = ip: builtins.elem (targetVendor ip) asicVendors;
 
+              # NixOS-capable: stock riscv64 userspace is rv64gc (lp64d), so the
+              # SoC needs a hardware-FPU core. The in-order rc1-f "full" core and
+              # the out-of-order rc1-ma "macro" (rc1-f-class ISA, OoO) both have
+              # F/D; creek's rc1-s / stream's rc1-n SIGILL in userspace.
+              nixosCores = [
+                "rc1-f"
+                "rc1-ma"
+              ];
+              isNixosCapable = ip: lib.any (c: builtins.elem c nixosCores) (ip.cores or [ ]);
+
+              # A GPT+ESP+ext4 SD image of a NixOS system for this SoC, boot-through
+              # Weir (see nix/nixos-sdcard.nix). Cross-compiled to riscv64 from the
+              # build host. The hardware.river module supplies the firmware + the
+              # harbor-kmod driver package.
+              mkNixosSdcard =
+                name: ip:
+                (inputs.nixpkgs.lib.nixosSystem {
+                  modules = [
+                    ./nix/module.nix
+                    ./nix/nixos-sdcard.nix
+                    {
+                      hardware.river = {
+                        enable = true;
+                        ipPackage = ip;
+                      };
+                      nixpkgs.hostPlatform = "riscv64-linux";
+                      nixpkgs.buildPlatform = system;
+                      # module.nix needs the Weir firmware + harbor-kmod driver.
+                      nixpkgs.overlays = [
+                        inputs.harbor.overlays.default
+                        inputs.weir.overlays.default
+                      ];
+                    }
+                  ];
+                }).config.system.build.image;
+
               mkDevicePackages =
                 name: cfg:
                 let
@@ -199,6 +258,9 @@
                 }
                 // lib.optionalAttrs (isFpga ip) {
                   "${name}-bitstream" = pkgs.river-hdl.mkFpga { inherit ip; };
+                }
+                // lib.optionalAttrs (isFpga ip && isNixosCapable ip) {
+                  "${name}-nixos-sdcard" = mkNixosSdcard name ip;
                 }
                 // lib.optionalAttrs (isAsic ip) {
                   "${name}-tapeout" = tapeout;

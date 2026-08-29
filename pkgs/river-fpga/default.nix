@@ -17,8 +17,16 @@
   stdenvNoCC,
   yosys,
   nextpnr,
+  # nextpnr-xilinx (0.8.2, from nixpkgs): the router that handles the dense
+  # creek SoC. The openXC7 0.9.x router regressed and cannot route it.
+  nextpnr-xilinx,
+  # Chipdb builder function {device, package} -> derivation, built from the same
+  # nextpnr-xilinx (the BBA schema is tied to the nextpnr source version).
+  nextpnrChipdb,
   icestorm,
   trellis,
+  # openXC7 supplies only the prjxray pack tools (fasm2frames/xc7frames2bit) and
+  # the python fasm module; nextpnr + chipdb + prjxray-db come from nixpkgs.
   openxc7 ? null,
   openxc7Nixpkgs ? null,
 }:
@@ -51,15 +59,22 @@ lib.extendMkDerivation {
       package = builtins.elemAt targetParts 2; # e.g. csga324
       part = "${device}${package}";
 
-      # openXC7 toolchain pieces (only forced on the spartan7 path).
-      chipdb = "${openxc7.nextpnr-xilinx-chipdb.spartan7}/${part}.bin";
-      xrayDb = "${openxc7.nextpnr-xilinx}/share/nextpnr/external/prjxray-db";
+      # Toolchain pieces (only forced on the spartan7 path). nextpnr + chipdb +
+      # prjxray-db come from nixpkgs (the routing 0.8.2 nextpnr); only the
+      # prjxray pack tools + fasm come from openXC7.
+      chipdb = "${nextpnrChipdb { inherit device package; }}/${part}.bin";
+      xrayDb = "${nextpnr-xilinx}/share/nextpnr/external/prjxray-db";
       pyPkgs = openxc7Nixpkgs.python312Packages;
       # prjxray's fasm2frames is a bare python script. Reproduce the openXC7
       # devShell PYTHONPATH so its fasm/prjxray/textx imports resolve.
+      # `fasm.parser` unconditionally does `import pyximport; pyximport.install()`
+      # (to JIT the fast antlr parser, falling back to the pure-python textx
+      # parser already listed below), so Cython must be on the path or the import
+      # aborts before the fallback.
       fasmPythonPath = lib.concatStringsSep ":" [
         "${openxc7.fasm}/lib/python3.12/site-packages"
         "${openxc7.prjxray}/usr/share/python3"
+        "${pyPkgs.cython}/lib/python3.12/site-packages"
         "${pyPkgs.textx}/lib/python3.12/site-packages"
         "${pyPkgs.arpeggio}/lib/python3.12/site-packages"
         "${pyPkgs.pyyaml}/lib/python3.12/site-packages"
@@ -76,8 +91,8 @@ lib.extendMkDerivation {
       ];
       xilinxTools = [
         yosys
-        openxc7.nextpnr-xilinx
-        openxc7.prjxray
+        nextpnr-xilinx # 0.8.2 from nixpkgs (routes creek)
+        openxc7.prjxray # fasm2frames + xc7frames2bit
         openxc7Nixpkgs.python312
       ];
     in

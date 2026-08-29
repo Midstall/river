@@ -292,9 +292,17 @@ class MicrocodeRom {
         final isShiftImm =
             (op.opcode & 0x7F) == 0x13 &&
             (op.funct3 == 0x1 || op.funct3 == 0x5);
+        // AMO/LR/SC: funct7[6:2] is funct5 (the op selector); funct7[1:0] are
+        // the aq/rl ordering hints and MUST NOT take part in the match, else
+        // ordered atomics (sc.w.rl, amoadd.w.aqrl, ...) fail to decode and trap
+        // illegal. Match funct5 only (bits 31:27); leave bits 26:25 don't-care.
+        final isAmo = (op.opcode & 0x7F) == 0x2F;
         if (isShiftImm) {
           mask |= (0x3F << 26);
           value |= ((op.funct7! >> 1) << 26);
+        } else if (isAmo) {
+          mask |= (0x1F << 27);
+          value |= ((op.funct7! >> 2) << 27);
         } else {
           mask |= (0x7F << 25);
           value |= (op.funct7! << 25);

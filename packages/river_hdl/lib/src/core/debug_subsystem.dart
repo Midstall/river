@@ -3,7 +3,6 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 import 'package:river/river.dart';
 
 import 'debug.dart';
-import 'jtag_bscan_tunnel.dart';
 import 'sba_wishbone.dart';
 
 /// SoC-level JTAG debug subsystem. On ECP5 it reaches the debugger over the FPGA
@@ -39,8 +38,20 @@ class RiverDebugSubsystem extends BridgeModule implements HarborJtagDebug {
         target is HarborFpgaTarget &&
         (target.vendor == HarborFpgaVendor.openXc7 ||
             target.vendor == HarborFpgaVendor.vivado);
+    // Verilator has no config-JTAG primitive to tap, so there is no user
+    // register to tunnel through and no tunnel at all: the TAP is exposed as
+    // raw top-level pins for the harness to bit-bang. OpenOCD then talks to a
+    // plain RISC-V TAP, WITHOUT `riscv use_bscan_tunnel`.
+    final rawJtag = target is HarborSimTarget;
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
+    if (rawJtag) {
+      createPort('jtag_tck', PortDirection.input);
+      createPort('jtag_tms', PortDirection.input);
+      createPort('jtag_tdi', PortDirection.input);
+      createPort('jtag_trst', PortDirection.input);
+      addOutput('jtag_tdo');
+    }
     // Core-facing: from the core.
     createPort('hart_halted', PortDirection.input);
     createPort('reg_rdata', PortDirection.input, width: xlen);
@@ -64,11 +75,16 @@ class RiverDebugSubsystem extends BridgeModule implements HarborJtagDebug {
 
     // Tunnel: framed config-JTAG DR scan -> inner TAP signals. Fed by the
     // vendor's config-JTAG user-register primitive below.
-    final tunnel = JtagBscanTunnel(maxScanBits: xlen);
-    tunnel.input('clk').srcConnection! <= input('clk');
-    tunnel.input('reset').srcConnection! <= input('reset');
+    JtagBscanTunnel? tunnel;
+    if (!rawJtag) {
+      tunnel = JtagBscanTunnel(maxScanBits: xlen);
+      tunnel.input('clk').srcConnection! <= input('clk');
+      tunnel.input('reset').srcConnection! <= input('reset');
+    }
 
-    if (useBscane2) {
+    if (rawJtag) {
+      // Nothing between the pins and the TAP.
+    } else if (useBscane2) {
       // Xilinx 7-series BSCANE2 on USER4 (JTAG_CHAIN=4, IR 0x23). riscv-openocd's
       // bscan tunnel HARDCODES USER4 for tunneled DMI scans (riscv.c select_user4
       // = 0x23), so the DM must ride USER4, not USER1, or SEL never asserts and
@@ -78,24 +94,26 @@ class RiverDebugSubsystem extends BridgeModule implements HarborJtagDebug {
       // gated data-register clock, mis-frames it). The tunnel gates advance with
       // SEL & SHIFT; SEL = this user chain selected (the JCE1 equivalent); the
       // active-high RESET inverts to the tunnel's active-low jrstn.
+      final t = tunnel!;
       final bscan = XilinxBscane2(jtagChain: 4);
-      tunnel.input('jtck').srcConnection! <= bscan.output('TCK');
-      tunnel.input('jtdi').srcConnection! <= bscan.output('TDI');
-      tunnel.input('jshift').srcConnection! <= bscan.output('SHIFT');
-      tunnel.input('jupdate').srcConnection! <= bscan.output('UPDATE');
-      tunnel.input('jce1').srcConnection! <= bscan.output('SEL');
-      tunnel.input('jrstn').srcConnection! <= ~bscan.output('RESET');
-      bscan.input('TDO').srcConnection! <= tunnel.output('jtdo1');
+      t.input('jtck').srcConnection! <= bscan.output('TCK');
+      t.input('jtdi').srcConnection! <= bscan.output('TDI');
+      t.input('jshift').srcConnection! <= bscan.output('SHIFT');
+      t.input('jupdate').srcConnection! <= bscan.output('UPDATE');
+      t.input('jce1').srcConnection! <= bscan.output('SEL');
+      t.input('jrstn').srcConnection! <= ~bscan.output('RESET');
+      bscan.input('TDO').srcConnection! <= t.output('jtdo1');
     } else {
       // ECP5 config-JTAG user register taps (ER1).
+      final t = tunnel!;
       final jtagg = Ecp5Jtagg();
-      tunnel.input('jtck').srcConnection! <= jtagg.output('JTCK');
-      tunnel.input('jtdi').srcConnection! <= jtagg.output('JTDI');
-      tunnel.input('jshift').srcConnection! <= jtagg.output('JSHIFT');
-      tunnel.input('jupdate').srcConnection! <= jtagg.output('JUPDATE');
-      tunnel.input('jce1').srcConnection! <= jtagg.output('JCE1');
-      tunnel.input('jrstn').srcConnection! <= jtagg.output('JRSTN');
-      jtagg.input('JTDO1').srcConnection! <= tunnel.output('jtdo1');
+      t.input('jtck').srcConnection! <= jtagg.output('JTCK');
+      t.input('jtdi').srcConnection! <= jtagg.output('JTDI');
+      t.input('jshift').srcConnection! <= jtagg.output('JSHIFT');
+      t.input('jupdate').srcConnection! <= jtagg.output('JUPDATE');
+      t.input('jce1').srcConnection! <= jtagg.output('JCE1');
+      t.input('jrstn').srcConnection! <= jtagg.output('JRSTN');
+      jtagg.input('JTDO1').srcConnection! <= t.output('jtdo1');
       jtagg.input('JTDO2').srcConnection! <= Const(0);
     }
 
@@ -106,10 +124,11 @@ class RiverDebugSubsystem extends BridgeModule implements HarborJtagDebug {
     final dm = RiverDebugModule(
       input('clk'),
       input('reset'),
-      tunnel.output('inner_tck'),
-      tunnel.output('inner_tms'),
-      tunnel.output('inner_tdi'),
-      tunnel.output('inner_trst_n'),
+      rawJtag ? input('jtag_tck') : tunnel!.output('inner_tck'),
+      rawJtag ? input('jtag_tms') : tunnel!.output('inner_tms'),
+      rawJtag ? input('jtag_tdi') : tunnel!.output('inner_tdi'),
+      // The harness drives TRST active-high; the TAP wants active-low.
+      rawJtag ? ~input('jtag_trst') : tunnel!.output('inner_trst_n'),
       hartHalted: input('hart_halted'),
       regRdata: input('reg_rdata'),
       regReady: input('reg_ready'),
@@ -118,7 +137,11 @@ class RiverDebugSubsystem extends BridgeModule implements HarborJtagDebug {
       xlen: xlen,
       idcode: idcode,
     );
-    tunnel.input('inner_tdo').srcConnection! <= dm.tdo;
+    if (rawJtag) {
+      output('jtag_tdo') <= dm.tdo;
+    } else {
+      tunnel!.input('inner_tdo').srcConnection! <= dm.tdo;
+    }
 
     // DM outputs to the core.
     output('halt_req') <= dm.haltReq;

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:rohd/rohd.dart';
 import 'package:rohd_hcl/rohd_hcl.dart' hide DataPortInterface, DataPortGroup;
@@ -15,9 +16,25 @@ Future<void> coreTest(
   int nextPc = 4,
   int latency = 0,
   int memLatency = 0,
+  // Privilege the core holds coming out of reset. Defaults to machine (real
+  // RISC-V reset). Set to supervisor/user to exercise paged data translation
+  // without a boot-time mret: M-mode data accesses are always physical.
+  PrivilegeMode? startPriv,
+  // Cycle budget to reach nextPc. A wedged core never reaches it, so a small
+  // budget lets a repro fail in seconds instead of grinding the full default.
+  int maxCycles = 200000,
+  // Raise the machine-timer-pending line (mip.MTIP) at this run-loop cycle to
+  // inject an async timer interrupt mid-execution. Null = never (no interrupt
+  // input wired, so existing callers are unaffected).
+  int? raiseTimerIrqAt,
+  // Lower mip.MTIP at this run-loop cycle, modelling the handler clearing the
+  // timer (an mtimecmp write) so the interrupt is taken once and does not storm
+  // on every mret. Null = leave it asserted (level) once raised.
+  int? lowerTimerIrqAt,
 }) async {
   final clk = SimpleClockGenerator(20).clk;
   final reset = Logic();
+  final timerIrq = raiseTimerIrqAt == null ? null : Logic(name: 'timerIrq');
 
   final addrWidth = config.mxlen.size;
   final wbConfig = WishboneConfig(
@@ -30,12 +47,25 @@ Future<void> coreTest(
   // write also lands in the OoO prf so initRegisters reaches the OoO read path.
   final prfSeedMode = Logic(name: 'prfSeedMode');
 
-  final core = RiverCore(config, busConfig: wbConfig, prfSeedMode: prfSeedMode);
+  final core = RiverCore(
+    config,
+    busConfig: wbConfig,
+    prfSeedMode: prfSeedMode,
+    resetPrivilege: startPriv?.id,
+    timerPending: timerIrq,
+  );
+  timerIrq?.inject(0);
 
   core.input('clk').srcConnection! <= clk;
   core.input('reset').srcConnection! <= reset;
 
   await core.build();
+
+  // Optional VCD dump for debugging (set RIVER_WAVE=/path/to.vcd).
+  final wavePath = Platform.environment['RIVER_WAVE'];
+  if (wavePath != null && wavePath.isNotEmpty) {
+    WaveDumper(core, outputPath: wavePath);
+  }
 
   final storage = SparseMemoryStorage(
     addrWidth: addrWidth,
@@ -110,7 +140,7 @@ Future<void> coreTest(
     storage.loadMemString(memString);
   });
 
-  Simulator.setMaxSimTime(100000);
+  Simulator.setMaxSimTime(4000000);
   unawaited(Simulator.run());
 
   await clk.nextPosedge;
@@ -136,10 +166,37 @@ Future<void> coreTest(
     await clk.nextPosedge;
   }
 
-  for (var i = 0; i < 5000; i++) {
+  final trace = Platform.environment['RIVER_TRACE']?.isNotEmpty ?? false;
+  final distinctPcs = <int>[];
+  var reached = false;
+  for (var i = 0; i < maxCycles; i++) {
     await clk.nextPosedge;
+    if (i == raiseTimerIrqAt) timerIrq!.inject(1);
+    if (i == lowerTimerIrqAt) timerIrq!.inject(0);
     final pc = core.pipeline.nextPc.value;
-    if (pc.isValid && pc.toInt() == nextPc) break;
+    if (trace && pc.isValid) {
+      final v = pc.toInt();
+      if (distinctPcs.isEmpty || distinctPcs.last != v) distinctPcs.add(v);
+    }
+    if (pc.isValid && pc.toInt() == nextPc) {
+      reached = true;
+      break;
+    }
+  }
+  if (trace && !reached) {
+    final tail = distinctPcs.length > 40
+        ? distinctPcs.sublist(distinctPcs.length - 40)
+        : distinctPcs;
+    // ignore: avoid_print
+    print(
+      '[TRACE] did not reach 0x${nextPc.toRadixString(16)}; last PCs: '
+      '${tail.map((p) => '0x${p.toRadixString(16)}').join(' ')}',
+    );
+    for (final r in [Register.x1, Register.x5, Register.x6, Register.x10]) {
+      final rv = core.regs.getData(LogicValue.ofInt(r.value, 5));
+      // ignore: avoid_print
+      print('[TRACE] $r = 0x${rv?.toInt().toRadixString(16)}');
+    }
   }
 
   await Simulator.endSimulation();

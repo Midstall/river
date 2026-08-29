@@ -10,15 +10,15 @@
       "locked": {
         "lastModified": 1777243449,
         "narHash": "sha256-NtXLD5EqWrTqf0k15BT6IkC3y6T7LLoG9005Y1gfP5E=",
-        "owner": "MidstallSoftware",
-        "repo": "asix",
+        "ref": "refs/heads/master",
         "rev": "31303a2eb9ee8b4504baa3fa5ae0bf08bc1268cc",
-        "type": "github"
+        "revCount": 3,
+        "type": "git",
+        "url": "https://git.lilithsemi.com/LilithSemi/asix"
       },
       "original": {
-        "owner": "MidstallSoftware",
-        "repo": "asix",
-        "type": "github"
+        "type": "git",
+        "url": "https://git.lilithsemi.com/LilithSemi/asix"
       }
     },
     "flake-parts": {
@@ -74,6 +74,32 @@
         "type": "github"
       }
     },
+    "harbor": {
+      "inputs": {
+        "flakever": [
+          "flakever"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "treefmt-nix": [
+          "treefmt-nix"
+        ]
+      },
+      "locked": {
+        "lastModified": 1788033340,
+        "narHash": "sha256-O+y5lb3cR3Ebm92NUTCgCvbJyLlJ0De/d9j5Jn5F8/U=",
+        "ref": "refs/heads/master",
+        "rev": "ddc1d70d05a67ba5a9fe0be33d3852795d07581e",
+        "revCount": 32,
+        "type": "git",
+        "url": "https://git.lilithsemi.com/LilithSemi/harbor"
+      },
+      "original": {
+        "type": "git",
+        "url": "https://git.lilithsemi.com/LilithSemi/harbor"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1776555070,
@@ -127,9 +153,11 @@
         "asix": "asix",
         "flake-parts": "flake-parts",
         "flakever": "flakever",
+        "harbor": "harbor",
         "nixpkgs": "nixpkgs",
         "openxc7": "openxc7",
-        "treefmt-nix": "treefmt-nix_2"
+        "treefmt-nix": "treefmt-nix_2",
+        "weir": "weir"
       }
     },
     "systems": {
@@ -186,6 +214,35 @@
         "owner": "numtide",
         "repo": "treefmt-nix",
         "type": "github"
+      }
+    },
+    "weir": {
+      "inputs": {
+        "flake-parts": [
+          "flake-parts"
+        ],
+        "flakever": [
+          "flakever"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "treefmt-nix": [
+          "treefmt-nix"
+        ]
+      },
+      "locked": {
+        "lastModified": 1787442515,
+        "narHash": "sha256-0nVSFfaNeQJe0gUlwDQG+GRiaqM3gY+4Yl7i0+wXghk=",
+        "ref": "refs/heads/master",
+        "rev": "35bae07702e4e6a82db3a54eed1135f950f5cf31",
+        "revCount": 7,
+        "type": "git",
+        "url": "https://git.lilithsemi.com/LilithSemi/weir"
+      },
+      "original": {
+        "type": "git",
+        "url": "https://git.lilithsemi.com/LilithSemi/weir"
       }
     }
   },

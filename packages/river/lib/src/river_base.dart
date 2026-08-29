@@ -188,7 +188,7 @@ class InterruptController {
 
 /// River's allocated RISC-V architecture ID (`marchid`), from the official
 /// registry: https://github.com/riscv/riscv-isa-manual/blob/main/marchid.md
-/// (Midstall Software, entry 49). This is the default [RiverCoreConfig.archId].
+/// (River, entry 49). This is the default [RiverCoreConfig.archId].
 const int riverArchId = 49;
 
 class RiverCoreConfig {

@@ -27,6 +27,12 @@ class CompressedFetchBuffer extends Module {
   Logic get valid1 => output('valid1');
   Logic get compressed1 => output('compressed1');
 
+  /// Asserted with `valid0` when the head instruction could not be fetched
+  /// because its translation faulted (the refill returned done AND not valid with
+  /// `fault` set). The pipeline runs the slot as a bubble and the exec stage
+  /// raises an instruction page fault at [pc0] instead of executing.
+  Logic get fetchFault => output('fetch_fault');
+
   /// FIFO depth in words (power of two >= 4 so a 4-halfword window always spans
   /// available words even at 32-bit data width).
   final int depth;
@@ -41,6 +47,7 @@ class CompressedFetchBuffer extends Module {
     Logic? redirectPc,
     Logic? consume0,
     Logic? consume1,
+    Logic? fault,
     this.depth = 4,
     super.name = 'compressed_fetch_buffer',
   }) : super(definitionName: 'CompressedFetchBuffer') {
@@ -61,6 +68,7 @@ class CompressedFetchBuffer extends Module {
     );
     consume0 = addInput('consume0', consume0 ?? Const(0));
     consume1 = addInput('consume1', consume1 ?? Const(0));
+    fault = addInput('fault', fault ?? Const(0));
 
     memRead = memRead.clone()
       ..connectIO(
@@ -79,6 +87,7 @@ class CompressedFetchBuffer extends Module {
     addOutput('pc1', width: w);
     addOutput('valid1');
     addOutput('compressed1');
+    addOutput('fetch_fault');
 
     final dataW = memRead.data.width;
     final wordBytes = dataW ~/ 8;
@@ -106,6 +115,10 @@ class CompressedFetchBuffer extends Module {
     final reading = Logic(name: 'reading');
     final discard = Logic(name: 'discard');
     final started = Logic(name: 'started');
+    // Held once the head-word fetch faults, until a redirect flushes the buffer
+    // (the exec stage traps and resteers). While set the head slot is presented
+    // as a valid bubble carrying fetch_fault.
+    final faulted = Logic(name: 'faulted');
 
     Logic wordAtRel(int rel) {
       // wordArr[(head + rel) mod depth]
@@ -151,15 +164,20 @@ class CompressedFetchBuffer extends Module {
 
     final aligner = InstructionAligner(window, validHalves, laneCount: 4);
 
-    instr0 <= aligner.instr0;
+    // A faulting head is a bubble: present a NOP (addi x0,x0,0) so the decoder
+    // resolves cleanly in one cycle, valid0 high so it reaches exec, and
+    // fetch_fault set so exec raises the instruction page fault at pc0 (headPc,
+    // the faulting PC). No second lane on a fault.
+    instr0 <= mux(faulted, Const(0x13, width: 32), aligner.instr0);
     pc0 <= headPc;
-    valid0 <= aligner.valid0 & enable;
-    compressed0 <= aligner.compressed0;
+    valid0 <= (aligner.valid0 | faulted) & enable;
+    compressed0 <= mux(faulted, Const(0), aligner.compressed0);
     instr1 <= aligner.instr1;
     // pc1 = headPc + size0*2.
     pc1 <= headPc + (aligner.size0.zeroExtend(w) << 1);
-    valid1 <= aligner.valid1 & enable;
+    valid1 <= aligner.valid1 & ~faulted & enable;
     compressed1 <= aligner.compressed1;
+    fetchFault <= faulted & enable;
 
     // -- Consume / advance -------------------------------------------------
     final c0 = (consume0 & aligner.valid0 & enable & ~redirect).named('c0');
@@ -183,6 +201,21 @@ class CompressedFetchBuffer extends Module {
 
     // -- Read engine (fill the word FIFO; held-en, response-attributed) -----
     final readDone = (memRead.done & memRead.valid).named('read_done');
+    // The head-word read faulted (done AND not valid with `fault` set) while the
+    // FIFO is empty, so the faulting word IS the head instruction. Buffered valid
+    // words ahead of it are consumed first; the read holds at the faulting word
+    // (produce stays low) until the FIFO drains, then this catches.
+    final faultCatch =
+        (reading &
+                memRead.done &
+                ~memRead.valid &
+                fault &
+                ~discard &
+                ~redirect &
+                enable &
+                wordCount.eq(0) &
+                ~faulted)
+            .named('fault_catch');
     final produce =
         (reading & readDone & ~discard & ~redirect & enable & ~fifoFull).named(
           'produce',
@@ -205,13 +238,14 @@ class CompressedFetchBuffer extends Module {
           reading < 0,
           discard < 0,
           started < 0,
+          faulted < 0,
           memRead.en < 0,
           memRead.addr < 0,
         ],
         orElse: [
           If(
             ~enable,
-            then: [reading < 0, discard < 0, memRead.en < 0],
+            then: [reading < 0, discard < 0, faulted < 0, memRead.en < 0],
             orElse: [
               If(
                 redirect,
@@ -224,6 +258,7 @@ class CompressedFetchBuffer extends Module {
                   fetchPc < (redirectPc & alignMask),
                   reading < 1,
                   discard < 1, // drop the one stale in-flight word
+                  faulted < 0, // the trap resteered; the fault is delivered
                   memRead.en < 1,
                   memRead.addr < (redirectPc & alignMask),
                 ],
@@ -245,6 +280,8 @@ class CompressedFetchBuffer extends Module {
                   headPc < headPc + (consumed.zeroExtend(w) << 1),
                   fetchPc < nFetchPc,
                   reading < 1,
+                  // Latch a head-word fetch fault; held until a redirect flushes.
+                  If(faultCatch, then: [faulted < 1]),
                   memRead.en < 1,
                   If(
                     ~started,

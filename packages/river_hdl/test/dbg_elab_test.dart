@@ -52,4 +52,34 @@ void main() {
     expect(sv.contains('JTAGG'), isTrue);
     expect(sv.contains('BSCANE2'), isFalse);
   });
+
+  test(
+    'Verilator target exposes a raw TAP, no vendor primitive, no tunnel',
+    () async {
+      final sub = RiverDebugSubsystem(
+        cfg,
+        xlen: 64,
+        target: const HarborSimTarget(),
+      );
+      await sub.build();
+      final sv = sub.generateSynth();
+      // Verilator cannot compile either config-JTAG primitive, and with no user
+      // register to ride there is nothing for the bscan tunnel to decode.
+      expect(sv.contains('JTAGG'), isFalse);
+      expect(sv.contains('BSCANE2'), isFalse);
+      expect(sv.contains('JtagBscanTunnel'), isFalse);
+      // The TAP is driven straight off top-level pins that the generated C++
+      // remote_bitbang server bit-bangs.
+      for (final p in ['jtag_tck', 'jtag_tms', 'jtag_tdi', 'jtag_trst']) {
+        expect(
+          sub.tryInput(p),
+          isNotNull,
+          reason: '$p must be a top-level input',
+        );
+      }
+      expect(sub.tryOutput('jtag_tdo'), isNotNull);
+      // The debug module itself is unchanged.
+      expect(sv.contains('RiverDebugModule'), isTrue);
+    },
+  );
 }

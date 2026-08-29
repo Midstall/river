@@ -1,8 +1,8 @@
 import 'dart:async';
 
 import 'package:rohd/rohd.dart';
+import 'package:harbor/harbor.dart' show JtagBscanTunnel;
 import 'package:river_hdl/src/core/debug.dart';
-import 'package:river_hdl/src/core/jtag_bscan_tunnel.dart';
 import 'package:test/test.dart';
 
 /// Drives the [JtagBscanTunnel] + a real [RiverDebugModule] exactly as

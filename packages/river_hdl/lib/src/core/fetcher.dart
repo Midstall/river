@@ -370,14 +370,25 @@ class FetchUnit extends Module {
               // and starves the data port (a translated load would never run).
               enableRead < 0,
               memRead.addr < (pcLatch & alignment),
-              result < instrResult,
-              if (hasCompressed) compressed < isComp,
+              // On a fetch fault deliver a NOP (addi x0,x0,0): the fetched bits
+              // are garbage, and the microcode decoder will not validate garbage
+              // (decode_valid stays low), so exec never runs and the fetch_fault
+              // override never fires. A NOP decodes cleanly, exec runs, and the
+              // held fetch_fault turns it into an instruction page fault.
+              result < mux(faulted, Const(0x13, width: 32), instrResult),
+              if (hasCompressed) compressed < mux(faulted, Const(0), isComp),
             ]),
-            // Disabled: drop transient state.
+            // Disabled: drop transient state. `faulted` is per-instruction
+            // transient state too: the pipeline squashes the fetcher (~enable)
+            // when it traps on a fetch fault and resteers via currentPc, so if
+            // `faulted` is not dropped here it stays latched and the NEXT
+            // (successfully fetched) instruction is delivered with a stale
+            // fetch_fault -> a spurious instruction page fault loop.
             Iff(~enable, [
               complete < 0,
               phase2 < 0,
               pcLatch < pc,
+              faulted < 0,
               if (hasCompressed) compressed < 0,
               enableRead < 0,
               memRead.addr < 0,

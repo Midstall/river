@@ -38,6 +38,9 @@ lib.extendMkDerivation {
       memories ? [ ],
       devices ? [ ],
       target ? null,
+      # Optional Harbor board name (e.g. "arty-s7-50"): supplies the board's
+      # connector catalog so a `spi:...:iface=pmod@ja` device resolves its pins.
+      board ? null,
       pdkRoot ? null,
       pins ? [ ],
       bootProgram ? null,
@@ -51,8 +54,9 @@ lib.extendMkDerivation {
         "rc1-mi"
         "rc1-s"
         "rc1-m"
+        "rc1-f"
       ]
-    ) cores) "river-ip: cores must each be one of [rc1-n, rc1-mi, rc1-s, rc1-m]";
+    ) cores) "river-ip: cores must each be one of [rc1-n, rc1-mi, rc1-s, rc1-m, rc1-f]";
     assert lib.assertMsg (builtins.elem interconnect [
       "wishbone"
       "axi"
@@ -82,6 +86,7 @@ lib.extendMkDerivation {
       ) memories;
       deviceFlags = lib.concatMapStringsSep " " (d: "--device ${d}") devices;
       targetFlag = lib.optionalString (target != null) "--target ${target}";
+      boardFlag = lib.optionalString (board != null) "--board ${board}";
       pdkRootFlag = lib.optionalString (pdkRoot != null) "--pdk-root ${pdkRoot}";
       # Quote each pin: a spec may carry a space-separated IOSTANDARD/attr
       # (e.g. "clk=R2 SSTL135"), which must reach genip as ONE --pin argument.
@@ -97,6 +102,7 @@ lib.extendMkDerivation {
       "memories"
       "devices"
       "target"
+      "board"
       "pdkRoot"
       "pins"
       "bootProgram"
@@ -113,7 +119,7 @@ lib.extendMkDerivation {
 
       buildPhase = ''
         runHook preBuild
-        river-genip ${cliArgs} ${coreFlags} ${memoryFlags} ${deviceFlags} ${targetFlag} ${pdkRootFlag} ${pinFlags} ${bootProgramFlag} --output "$out"
+        river-genip ${cliArgs} ${coreFlags} ${memoryFlags} ${deviceFlags} ${targetFlag} ${boardFlag} ${pdkRootFlag} ${pinFlags} ${bootProgramFlag} --output "$out"
         runHook postBuild
       '';
 

@@ -350,6 +350,14 @@ class CsrFile {
       CsrAddress.scounteren.address,
     );
 
+    // senvcfg/menvcfg: River implements none of the envcfg-controlled features
+    // (Zicbo, pointer-masking, Sstc, Svpbmt), so every field is WARL-0 (writes
+    // drop, reads return 0). They exist so Linux's csrw/csrr (envcfg_update_bits
+    // context switch, try_to_set_pmm probe) do not trap illegal. Mirrors the HDL
+    // (csr.dart applyMask(.., 0)).
+    csrs[CsrAddress.senvcfg.address] = MaskedCsr(CsrAddress.senvcfg.address, 0);
+    csrs[CsrAddress.menvcfg.address] = MaskedCsr(CsrAddress.menvcfg.address, 0);
+
     csrs[CsrAddress.satp.address] = MaskedCsr(
       CsrAddress.satp.address,
       fullMask,
