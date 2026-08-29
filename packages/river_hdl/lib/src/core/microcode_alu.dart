@@ -54,9 +54,18 @@ class MicrocodeAlu extends Module {
     final srlw = (a.slice(31, 0) >>> shamtW).signExtend(xlen);
     final sraw = (a.slice(31, 0) >> shamtW).signExtend(xlen);
 
-    // Compares.
-    final slt = bmSignedLt(a, b, xlen).zeroExtend(xlen);
-    final sltu = a.lt(b).zeroExtend(xlen);
+    // Compares (the raw bits are reused by min/max below).
+    final sLtBit = bmSignedLt(a, b, xlen);
+    final uLtBit = a.lt(b);
+    final slt = sLtBit.zeroExtend(xlen);
+    final sltu = uLtBit.zeroExtend(xlen);
+
+    // Zbb min/max: select a or b on the same comparators. Not emitted by the
+    // rc1-f ROM, but the AMO combine drives these functs to reuse this unit.
+    final minR = mux(sLtBit, a, b);
+    final maxR = mux(sLtBit, b, a);
+    final minuR = mux(uLtBit, a, b);
+    final maxuR = mux(uLtBit, b, a);
 
     // Zicond conditional-zero.
     final bZero = b.eq(Const(0, width: xlen));
@@ -87,6 +96,10 @@ class MicrocodeAlu extends Module {
           item(MicroOpAluFunct.sraw, sraw),
           item(MicroOpAluFunct.slt, slt),
           item(MicroOpAluFunct.sltu, sltu),
+          item(MicroOpAluFunct.minOp, minR),
+          item(MicroOpAluFunct.maxOp, maxR),
+          item(MicroOpAluFunct.minuOp, minuR),
+          item(MicroOpAluFunct.maxuOp, maxuR),
           item(MicroOpAluFunct.czeroEqz, czE),
           item(MicroOpAluFunct.czeroNez, czN),
         ],

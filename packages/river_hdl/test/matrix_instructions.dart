@@ -667,6 +667,26 @@ List<MatrixCell> atomics(RiscVMxlen mxlen) => [
     operand: 5,
   ), // signed/unsigned-differing operands
   _lrsc('lr/sc.w', 0x2),
+  // Ordered lr.w.aq / sc.w.rl: the aq/rl bits (funct7[1:0]) are ordering hints,
+  // decode-transparent, and run identically on the in-order core. Guards the
+  // HW-found delta bug where sc.w.rl (funct7=0x0D) raised illegal because the
+  // decoder matched the full funct7 instead of funct5. Same result as lr/sc.w.
+  MatrixCell(
+    'lr.w.aq/sc.w.rl',
+    [
+      iimm(0x100, 0, 0x0, 10), // x10 = addr
+      iimm(42, 0, 0x0, 11), // x11 = store value
+      amo(0x02, 0, 10, 0x2, 12) | (1 << 26), // lr.w.aq x12 = mem, reserve
+      amo(0x03, 11, 10, 0x2, 13) | (1 << 25), // sc.w.rl x13 = 0 (ok), mem = 42
+      nop,
+    ],
+    dataMem: {
+      0x100: [77],
+    },
+    checkRegs: [Register.x12, Register.x13],
+    checkMem: [0x100],
+    nextPc: 0x14,
+  ),
   // sc-fail edge: a 2nd sc.w must FAIL (x14=1) since the 1st cleared the
   // reservation (folded from core_parity_test's LR/SC subtest).
   MatrixCell(

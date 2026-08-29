@@ -19,7 +19,7 @@ Future<void> main(List<String> arguments) async {
       abbr: 'c',
       help: 'Core model',
       defaultsTo: ['rc1-mi'],
-      allowed: ['rc1-n', 'rc1-mi', 'rc1-s', 'rc1-m'],
+      allowed: ['rc1-n', 'rc1-mi', 'rc1-s', 'rc1-m', 'rc1-f'],
     )
     ..addOption(
       'interconnect',
@@ -58,7 +58,8 @@ Future<void> main(List<String> arguments) async {
       'target',
       abbr: 't',
       help:
-          'Target (FPGA: ecp5:dev:pkg, ice40:dev:pkg; ASIC: sky130:hd, gf180mcu:3v3)',
+          'Target (FPGA: ecp5:dev:pkg, ice40:dev:pkg; ASIC: sky130:hd, '
+          'gf180mcu:3v3; SIM: verilator, verilator:trace)',
     )
     ..addOption(
       'board',
@@ -188,6 +189,8 @@ Future<void> main(List<String> arguments) async {
         print('  Target: ${t.vendor} ${t.device} (${t.package})');
       case AsicTarget():
         print('  Target: ${t.pdk} (${t.variant})');
+      case SimTarget():
+        print('  Target: verilator (sim${t.trace ? ', trace' : ''})');
     }
   }
 

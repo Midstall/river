@@ -52,4 +52,29 @@ void main() {
       }
     });
   }
+
+  // The AMO opcode carries aq/rl ordering hints in funct7[1:0]; funct7[6:2] is
+  // funct5. Ordering hints must NOT change decode. HW-observed on delta: the
+  // kernel faulted illegal on a cpuhp tracepoint's sc.w.rl (funct7=0x0D) because
+  // decode matched the whole funct7 (aq=rl=0). Sweep all 4 orderings.
+  for (final width in const [(0x2, 'w'), (0x3, 'd')]) {
+    test('atomics decode under any aq/rl ordering (.${width.$2})', () {
+      for (final e in funct5.entries) {
+        for (var order = 0; order < 4; order++) {
+          // order bit1=aq, bit0=rl. funct7 = funct5<<2 | order.
+          final funct7 = (e.key << 2) | order;
+          final instr = (funct7 << 25) | (width.$1 << 12) | 0x2F;
+          final op = config.isa.findOperation(instr);
+          expect(
+            op?.mnemonic,
+            '${e.value}.${width.$2}',
+            reason:
+                'funct5=0x${e.key.toRadixString(16)} aq/rl=$order instr='
+                '0x${instr.toRadixString(16)} should still be '
+                '${e.value}.${width.$2} (ordering is decode-irrelevant)',
+          );
+        }
+      }
+    });
+  }
 }

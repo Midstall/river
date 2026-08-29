@@ -70,6 +70,7 @@ class RiverCoreConfigV1 extends RiverCoreConfig {
     required super.mmu,
     required super.interrupts,
     required super.clock,
+    super.regfileReadLatency,
     HarborL1CacheConfig? l1cache,
   }) : super(
          l1cache: l1cache ?? _rc1L1(),
@@ -100,6 +101,7 @@ class RiverCoreConfigV1 extends RiverCoreConfig {
     required super.mmu,
     required super.interrupts,
     required super.clock,
+    super.regfileReadLatency,
     HarborL1CacheConfig? l1cache,
   }) : super(
          l1cache: l1cache ?? _rc1L1(),
@@ -122,7 +124,12 @@ class RiverCoreConfigV1 extends RiverCoreConfig {
          executionMode: ExecutionMode.inOrder,
          issueWidth: IssueWidth.single,
          // Same scalar personality as [small] (+ F/D), so it carries the same
-         // L1 caches (see [_rc1L1]).
+         // L1 caches (see [_rc1L1]) and the same microcode datapath: the shared
+         // ALU keeps area near ~12k (+ FPU) instead of the ~21k-LUT static
+         // fabric, and it lets yosys synthesize (the static exec unit's giant
+         // FSM does not converge). Matches [small]'s microcode settings.
+         microcodeMode: MicrocodeMode.full,
+         microcodeDecodeLanes: 2,
        );
 
   /// RC1.ma - River Core V1 macro (RV64GC_Zba_Zbb_Zbs): out-of-order,

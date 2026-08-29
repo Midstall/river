@@ -90,6 +90,30 @@ void main() {
       expect(d.params!.readRetry, 6);
     });
 
+    test('ddr3v2 ctrlgear=2 selects the CK/8 gearbox controller', () {
+      final d = Device.parse(
+        'dram:0x80000000:256M:arty-s7:ddr3v2=true,ctrlgear=2',
+      );
+      expect(d.params!.ddr3v2, isTrue);
+      expect(d.params!.ctrlGear, 2);
+    });
+
+    test(
+      'ctrlgear absent defaults to null (= gearRatio 1, byte-identical)',
+      () {
+        final d = Device.parse('dram:0x80000000:256M:arty-s7:ddr3v2=true');
+        expect(d.params!.ctrlGear, isNull);
+      },
+    );
+
+    test('ctrlgear only accepts 1 or 2', () {
+      expect(
+        () =>
+            Device.parse('dram:0x80000000:256M:arty-s7:ddr3v2=true,ctrlgear=3'),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
     test('usb-dfu with mode', () {
       final d = Device.parse('usb-dfu:0x0C000000:mode=software');
       expect(d.type, 'usb-dfu');
@@ -248,6 +272,78 @@ void main() {
         devices: [Device.parse('uart:0x10000000:ns16550a')],
       );
       expect(config.fpgaPinMap['clk'], 'Z99');
+    });
+
+    test('spi device iface=pmod@ja binds the four SPI pads to JA sites', () {
+      final config = RiverGenIpConfig(
+        name: 'b',
+        cores: const ['rc1-s'],
+        boardName: 'arty-s7-50',
+        devices: [Device.parse('spi:0x10001000:iface=pmod@ja')],
+      );
+      // Each SPI pad is a device pin on the spi controller, at the Digilent
+      // Pmod-SPI JA sites (JA1=L17 cs, JA2=L18 mosi, JA3=M14 miso, JA4=N14 sck).
+      final byName = {for (final p in config.effectivePins) p.externalName: p};
+      expect(byName['spi_cs']?.deviceName, 'spi');
+      expect(byName['spi_cs']?.portName, 'spi_cs_n');
+      expect(config.fpgaPinMap['spi_cs'], startsWith('L17'));
+      expect(config.fpgaPinMap['spi_mosi'], startsWith('L18'));
+      expect(config.fpgaPinMap['spi_miso'], startsWith('M14'));
+      expect(config.fpgaPinMap['spi_sck'], startsWith('N14'));
+    });
+
+    test('spi dma=true adds a second fabric master + harbor,dma DT prop', () async {
+      final config = RiverGenIpConfig(
+        name: 'dma_spi_soc',
+        cores: const ['rc1-n'],
+        clockFrequency: 48000000,
+        oscFrequency: 48000000,
+        devices: [
+          Device.parse('sram:0x80000000:64K'),
+          Device.parse('uart:0x10000000:ns16550a'),
+          Device.parse('spi:0x10001000:sdcard=true,dma=true'),
+        ],
+      );
+      // The dma param parses off the device string.
+      final spiDev = config.devices.firstWhere((d) => d.type == 'spi');
+      expect(spiDev.params?.dma, isTrue);
+
+      final soc = await config.buildSoC();
+      // Core + the SPI's integrated DMA engine = two bus masters on the fabric.
+      expect(soc.masters.length, equals(2), reason: 'core + spi dma master');
+
+      await soc.build();
+      // The device tree advertises the integrated DMA so firmware uses the fast
+      // DMA_ADDR/LEN/CTRL path instead of byte-by-byte PIO.
+      expect(soc.generateDts(), contains('harbor,dma'));
+    });
+
+    test('spi without dma stays a single-master, no harbor,dma prop', () async {
+      final config = RiverGenIpConfig(
+        name: 'pio_spi_soc',
+        cores: const ['rc1-n'],
+        clockFrequency: 48000000,
+        oscFrequency: 48000000,
+        devices: [
+          Device.parse('sram:0x80000000:64K'),
+          Device.parse('uart:0x10000000:ns16550a'),
+          Device.parse('spi:0x10001000:sdcard=true'),
+        ],
+      );
+      final soc = await config.buildSoC();
+      expect(soc.masters.length, equals(1), reason: 'core only');
+      await soc.build();
+      expect(soc.generateDts(), isNot(contains('harbor,dma')));
+    });
+
+    test('iface= on a non-spi device throws', () {
+      final config = RiverGenIpConfig(
+        name: 'b',
+        cores: const ['rc1-s'],
+        boardName: 'arty-s7-50',
+        devices: [Device.parse('uart:0x10000000:iface=pmod@ja')],
+      );
+      expect(() => config.effectivePins, throwsArgumentError);
     });
   });
 }

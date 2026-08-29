@@ -40,7 +40,11 @@ void main() {
   // PTEs: non-leaf = (nextPPN<<10)|V; leaf = (physPPN<<10)|V|R|W|X.
   //   l2[0]   @ 0x10000 = (0x11<<10)|1     = 0x4401
   //   l1[0]   @ 0x11000 = (0x12<<10)|1     = 0x4801
+  //   l0[0]   @ 0x12000 = (0x00<<10)|0xF   = 0x000F  (identity map of page 0)
   //   l0[0x20]@ 0x12100 = (0x30<<10)|0xF   = 0xC00F
+  // The paged tests run in S-mode, so the FETCH also translates: l0[0] identity
+  // maps the code page (0x0) so the instructions fetch cleanly while the data
+  // access at 0x20000 translates to the different page 0x30000.
   // Diagnostic: bare (paging off) 64-bit load through the modified MMU, no walk.
   test(
     'bare ld (no paging) loads 0x30000',
@@ -64,8 +68,8 @@ void main() {
     'Sv39 dport load translates 0x20000 -> 0x30000',
     timeout: Timeout(Duration(seconds: 60)),
     () => coreTest(
-      // satp (MODE=8 Sv39, root PPN 0x10) is preloaded into a0; enable paging,
-      // then load from virtual 0x20000 (mapped to physical 0x30000).
+      // Translation applies only in S/U mode (River has no mstatus.MPRV, so an
+      // M-mode data access is always physical). Run this in S-mode via startPriv.
       //   csrw satp, a0      (0x18051073)
       //   lui  a2, 0x20      (0x00020637)  -> a2 = 0x20000 (virtual)
       //   ld   a1, 0(a2)     (0x00063583)
@@ -76,6 +80,8 @@ void main() {
 01 44 00 00 00 00 00 00
 @11000
 01 48 00 00 00 00 00 00
+@12000
+0F 00 00 00 00 00 00 00
 @12100
 0F C0 00 00 00 00 00 00
 @30000
@@ -83,6 +89,7 @@ void main() {
 ''',
       {Register.x11: 0xCAFEF00D},
       config,
+      startPriv: PrivilegeMode.supervisor,
       initRegisters: {
         // satp: MODE=8 (Sv39) bits 63:60, root PPN = 0x10000>>12 = 0x10.
         Register.x10: 0x8000000000000010,
@@ -110,6 +117,8 @@ void main() {
 01 44 00 00 00 00 00 00
 @11000
 01 48 00 00 00 00 00 00
+@12000
+0F 00 00 00 00 00 00 00
 @12100
 0F C0 00 00 00 00 00 00
 @30000
@@ -117,6 +126,7 @@ void main() {
 ''',
       const {},
       config,
+      startPriv: PrivilegeMode.supervisor,
       initRegisters: {Register.x10: 0x8000000000000010},
       // The translated physical address 0x30000 holds the stored value.
       memStates: {0x30000: 0x234},
@@ -168,6 +178,8 @@ void main() {
 01 48 00 00 00 00 00 00
 @12000
 01 4C 00 00 00 00 00 00
+@13000
+0F 00 00 00 00 00 00 00
 @13100
 0F C0 00 00 00 00 00 00
 @30000
@@ -175,6 +187,7 @@ void main() {
 ''',
       {Register.x11: 0xCAFEF00D},
       sv48Config,
+      startPriv: PrivilegeMode.supervisor,
       initRegisters: {
         // satp: MODE=9 (Sv48) bits 63:60, root PPN 0x10.
         Register.x10: 0x9000000000000010,

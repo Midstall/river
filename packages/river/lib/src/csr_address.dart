@@ -17,6 +17,7 @@ enum CsrAddress {
   mie(0x304),
   mtvec(0x305),
   mcounteren(0x306),
+  menvcfg(0x30A),
   mstatush(0x310),
 
   // Machine Trap Handling
@@ -35,6 +36,7 @@ enum CsrAddress {
   sie(0x104),
   stvec(0x105),
   scounteren(0x106),
+  senvcfg(0x10A),
 
   // Supervisor Trap Handling
   sscratch(0x140),

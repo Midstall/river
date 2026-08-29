@@ -137,6 +137,12 @@ abstract class ExecutionUnit extends Module {
   late final Logic? medeleg;
   late final Logic? mtvec;
   late final Logic? stvec;
+  // Async interrupt take (computed in core.dart from mip&mie + mode/delegation).
+  // When [interruptTake] is high at an instruction boundary (mopStep==0), an
+  // interrupt trap with cause [interruptCause] is taken instead of the fetched
+  // instruction, vectoring through the shared trap helpers.
+  late final Logic? interruptTake;
+  late final Logic? interruptCause;
   late final Logic?
   virtIn; // V-bit: VS-mode access to an HS-only CSR -> cause 22
   // Smstateen SE0 bits, for the VS-mode state-enable virtual-instruction nuance.
@@ -260,6 +266,7 @@ abstract class ExecutionUnit extends Module {
   Logic get nextMode => output('nextMode');
   Logic get trap => output('trap');
   Logic get trapCause => output('trapCause');
+  Logic get trapInterrupt => output('trapInterrupt');
   Logic get trapTval => output('trapTval');
   Logic get trapEpc => output('trapEpc');
   Logic get isReturn => output('isReturn');
@@ -297,6 +304,8 @@ abstract class ExecutionUnit extends Module {
     Logic? medeleg,
     Logic? mtvec,
     Logic? stvec,
+    Logic? interruptTake,
+    Logic? interruptCause,
     Logic? virtIn,
     Logic? mstateen0Se0,
     Logic? hstateen0Se0,
@@ -449,6 +458,17 @@ abstract class ExecutionUnit extends Module {
     } else {
       this.stvec = null;
     }
+    if (interruptTake != null) {
+      this.interruptTake = addInput('interruptTake', interruptTake);
+      this.interruptCause = addInput(
+        'interruptCause',
+        interruptCause!,
+        width: 6,
+      );
+    } else {
+      this.interruptTake = null;
+      this.interruptCause = null;
+    }
     if (virtIn != null) {
       this.virtIn = addInput('virtIn', virtIn);
     } else {
@@ -473,6 +493,10 @@ abstract class ExecutionUnit extends Module {
     addOutput('nextMode', width: 3);
     addOutput('trap');
     addOutput('trapCause', width: 6);
+    // 1 when the committed trap is an interrupt (async), 0 for a synchronous
+    // exception. The core sets mcause bit XLEN-1 from this; trapCause carries
+    // only the low cause code (also used for delegation indexing).
+    addOutput('trapInterrupt');
     addOutput('trapTval', width: mxlen.size);
     // PC of the trapping instruction → {m,s}epc. Captured here (not from the
     // core's live pc register, which has already advanced to tvec by the time
@@ -528,6 +552,10 @@ abstract class ExecutionUnit extends Module {
         numEntries: 32,
         dataWidth: 64,
         name: 'fp_regfile',
+        // RISC-V has no hardwired-zero float register: f0/ft0 is a normal
+        // storage entry (unlike integer x0). Without this the default
+        // reservedZero=true forces f0 to read as zero regardless of writes.
+        reservedZero: false,
       );
       fpRegs.input('clk').srcConnection! <= clk;
       fpRegs.input('reset').srcConnection! <= reset;
@@ -867,6 +895,7 @@ abstract class ExecutionUnit extends Module {
           mopStep < 0,
           done < 0,
           output('trap') < 0,
+          output('trapInterrupt') < 0,
           output('trapEpc') < currentPc,
           output('isReturn') < 0,
           output('returnLevel') < 0,
@@ -938,41 +967,72 @@ abstract class ExecutionUnit extends Module {
               output('memGuest') < 0,
               // A fetch fault means there is no instruction to run: raise an
               // instruction page fault at currentPc (the faulting PC) instead.
+              // An async interrupt is taken only at a CLEAN instruction boundary:
+              // mopStep==0 AND no memory or register-write side effect is in
+              // flight. mopStep==0 alone is NOT a clean boundary. An atomic runs
+              // its whole read-modify-write at mopStep==0 (the read-completion
+              // wrapper issues the write and the write-completion wrapper writes
+              // rd, neither advances mopStep), so mopStep stays 0 across the
+              // memRead wait, the memWrite wait and the rd commit. Taking the
+              // interrupt during that window lets the posted write commit on
+              // silicon while rd and the PC do not retire, so the atomic re-runs
+              // and applies the operation twice (a skipped ticket that deadlocks
+              // a ticket spinlock). It also leaves memRead/memWrite.en asserted
+              // into the handler, because rawTrap does not clear them. Gating on
+              // the held (registered) memRead.en, memWrite.en and rdWrite.en
+              // holds the interrupt off until the access retires, so the atomic
+              // is indivisible with respect to the interrupt. At a true boundary
+              // all three are 0 and epc is the not-yet-run instruction. It
+              // vectors through the same rawTrap path as a synchronous trap.
               If(
-                fetchFaultIn,
-                then: doTrap(Trap.instructionPageFault, currentPc),
-                orElse: microcodeRead != null
-                    ? cycleMicrocode(
-                        instrIndex,
-                        mopStep,
-                        microcodeRead,
-                        alu: alu,
-                        rs1: rs1,
-                        rs2: rs2,
-                        rd: rd,
-                        imm: imm,
-                        fields: fields,
-                        memRead: memRead,
-                        memWrite: memWrite,
-                        rs1Read: rs1Read,
-                        rs2Read: rs2Read,
-                        rdWrite: rdWrite,
-                      )
-                    : cycle(
-                        instrIndex,
-                        mopStep,
-                        alu: alu,
-                        rs1: rs1,
-                        rs2: rs2,
-                        rd: rd,
-                        imm: imm,
-                        fields: fields,
-                        memRead: memRead,
-                        memWrite: memWrite,
-                        rs1Read: rs1Read,
-                        rs2Read: rs2Read,
-                        rdWrite: rdWrite,
-                      ),
+                (this.interruptTake ?? Const(0)) &
+                    mopStep.eq(0) &
+                    ~memRead.en &
+                    ~memWrite.en &
+                    ~rdWrite.en,
+                then: rawTrap(
+                  Const(1),
+                  this.interruptCause ?? Const(0, width: 6),
+                  Const(0, width: mxlen.size),
+                ),
+                orElse: [
+                  If(
+                    fetchFaultIn,
+                    then: doTrap(Trap.instructionPageFault, currentPc),
+                    orElse: microcodeRead != null
+                        ? cycleMicrocode(
+                            instrIndex,
+                            mopStep,
+                            microcodeRead,
+                            alu: alu,
+                            rs1: rs1,
+                            rs2: rs2,
+                            rd: rd,
+                            imm: imm,
+                            fields: fields,
+                            memRead: memRead,
+                            memWrite: memWrite,
+                            rs1Read: rs1Read,
+                            rs2Read: rs2Read,
+                            rdWrite: rdWrite,
+                          )
+                        : cycle(
+                            instrIndex,
+                            mopStep,
+                            alu: alu,
+                            rs1: rs1,
+                            rs2: rs2,
+                            rd: rd,
+                            imm: imm,
+                            fields: fields,
+                            memRead: memRead,
+                            memWrite: memWrite,
+                            rs1Read: rs1Read,
+                            rs2Read: rs2Read,
+                            rdWrite: rdWrite,
+                          ),
+                  ),
+                ],
               ),
             ],
             orElse: [
@@ -1129,6 +1189,7 @@ abstract class ExecutionUnit extends Module {
     if (csrRead == null || csrWrite == null) {
       return [
         trapCause < encodeCause(trapInterrupt, effCause).slice(5, 0),
+        output('trapInterrupt') < trapInterrupt,
         trapTval < (tval ?? Const(0, width: mxlen.size)),
         output('trapEpc') < currentPc,
         output('trap') < 1,
@@ -1155,6 +1216,7 @@ abstract class ExecutionUnit extends Module {
             trapInterrupt,
             effCause,
           ).slice(5, 0).named('cause$suffix'),
+      output('trapInterrupt') < trapInterrupt,
       trapTval < (tval ?? Const(0, width: mxlen.size)),
       output('trapEpc') < currentPc,
 
@@ -1237,6 +1299,8 @@ class DynamicExecutionUnit extends ExecutionUnit {
     super.medeleg,
     super.mtvec,
     super.stvec,
+    super.interruptTake,
+    super.interruptCause,
     super.virtIn,
     super.mstateen0Se0,
     super.hstateen0Se0,
@@ -2873,6 +2937,8 @@ class StaticExecutionUnit extends ExecutionUnit {
     super.medeleg,
     super.mtvec,
     super.stvec,
+    super.interruptTake,
+    super.interruptCause,
     super.virtIn,
     super.mstateen0Se0,
     super.hstateen0Se0,

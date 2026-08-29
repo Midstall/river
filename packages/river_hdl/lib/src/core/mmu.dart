@@ -202,12 +202,17 @@ class RiverMmu extends Module {
     final ftlbValid = Logic(name: 'ftlbValid');
     final ftlbVpn = Logic(name: 'ftlbVpn', width: xlen - 12);
     final ftlbPte = Logic(name: 'ftlbPte', width: xlen);
+    // Leaf level of the cached fetch translation, so a hit composes the physical
+    // address with the right superpage offset.
+    final ftlbLevel = Logic(name: 'ftlbLevel', width: 3);
     // Single-entry data TLB (mirrors the fetch TLB). `dtlbPte` holds the leaf so
     // R/W/U re-checks per access. Single-stage only: guest (two-stage) accesses
     // always walk (the cached leaf would be guest-physical). Flushed with ftlb.
     final dtlbValid = Logic(name: 'dtlbValid');
     final dtlbVpn = Logic(name: 'dtlbVpn', width: xlen - 12);
     final dtlbPte = Logic(name: 'dtlbPte', width: xlen);
+    // Leaf level of the cached data translation (see ftlbLevel).
+    final dtlbLevel = Logic(name: 'dtlbLevel', width: 3);
     final satpShadowMode = Logic(name: 'satpShadowMode', width: 4);
     final satpShadowRoot = Logic(name: 'satpShadowRoot', width: xlen);
     // Shadow of the privilege mode, to detect a context switch for DTLBFC.
@@ -278,9 +283,28 @@ class RiverMmu extends Module {
     }
 
     Logic pteNextBase(Logic pte) => (pte.slice(53, 10) << 12).zeroExtend(xlen);
-    // Translated physical address for a 4KB leaf: {PTE.PPN, vaddr[11:0]}.
-    Logic leafPa(Logic pte, Logic vaddr) =>
-        [pte.slice(53, 10), vaddr.slice(11, 0)].swizzle().zeroExtend(xlen);
+    // Translated physical address for a leaf at `level`. A leaf above level 0 is
+    // a superpage, so the low VPN fields come from the virtual address, not the
+    // PTE PPN: level 1 (2MB) keeps vaddr[20:0], level 2 (1GB) vaddr[29:0], level
+    // 3 (512GB, Sv48) vaddr[38:0]. Taking only vaddr[11:0] for every level would
+    // alias all sub-pages of a superpage to its base.
+    Logic leafPa(Logic pte, Logic vaddr, Logic level) {
+      final ppn = pte.slice(53, 10); // 44-bit PPN
+      // {ppn[43:hi], vaddr[lo:0]}: hi is the first PPN bit kept from the PTE, lo
+      // is the top virtual bit taken from vaddr. Each pairing sums to 56 bits.
+      Logic compose(int hi, int lo) =>
+          [ppn.slice(43, hi), vaddr.slice(lo, 0)].swizzle().zeroExtend(xlen);
+      return mux(
+        level.eq(0),
+        compose(0, 11),
+        mux(
+          level.eq(1),
+          compose(9, 20),
+          mux(level.eq(2), compose(18, 29), compose(27, 38)),
+        ),
+      );
+    }
+
     // First-level (root) PTE byte address.
     Logic ptePtr(Logic base, Logic vpn) => base + (vpn.zeroExtend(xlen) << 3);
     final fullSel = Const((1 << selW) - 1, width: selW);
@@ -317,6 +341,22 @@ class RiverMmu extends Module {
               priv.neq(Const(PrivilegeMode.machine.id, width: 3)) &
               (virtIn == null ? Const(1) : ~virtIn));
 
+    // Data (load/store) translation is ALSO off in machine mode. River does not
+    // implement mstatus.MPRV, so the effective data privilege is just the
+    // current privilege: an M-mode load/store is always physical. Without this
+    // gate, once supervisor enables paging (satp.MODE != 0) an M-mode access
+    // (e.g. the SBI firmware restoring its own stack in a trap handler) would be
+    // walked through the SUPERVISOR page tables - its physical address is not a
+    // valid supervisor VA, so the walk faults or the bus access never returns
+    // and the core hangs. The one M-mode exception is an explicit virtualized
+    // access (HLV/HSV): those carry [virtIn] and must translate through the
+    // guest tables regardless of the current privilege, so OR virtIn back in.
+    final dataPagingOn = priv == null
+        ? pagingOn
+        : (pagingOn &
+              (priv.neq(Const(PrivilegeMode.machine.id, width: 3)) |
+                  (virtIn ?? Const(0))));
+
     // Fetch-TLB lookup for the requested fetch address.
     final satpChanged = hasPaging
         ? (satpMode!.neq(satpShadowMode) | satpRoot!.neq(satpShadowRoot))
@@ -334,7 +374,7 @@ class RiverMmu extends Module {
         ? leafPermFault(ftlbPte, Const(1), Const(0))
         : Const(0);
     final ftlbPa = hasPaging
-        ? leafPa(ftlbPte, ifetchAddr)
+        ? leafPa(ftlbPte, ifetchAddr, ftlbLevel)
         : Const(0, width: xlen);
 
     // G-stage derived signals. twoStage = guest mode with a non-bare G-stage.
@@ -378,7 +418,7 @@ class RiverMmu extends Module {
         ? ((~wbDatMiso[6] | (reqWe & ~wbDatMiso[7])) & dtlbUsable)
         : Const(0);
     final dtlbPa = hasPaging
-        ? leafPa(dtlbPte, dportAddr)
+        ? leafPa(dtlbPte, dportAddr, dtlbLevel)
         : Const(0, width: xlen);
 
     Sequential(clk, [
@@ -406,6 +446,8 @@ class RiverMmu extends Module {
           dtlbVpn < 0,
           dtlbPte < 0,
           ftlbPte < 0,
+          ftlbLevel < 0,
+          dtlbLevel < 0,
           satpShadowMode < 0,
           satpShadowRoot < 0,
           privShadow < 0,
@@ -505,7 +547,7 @@ class RiverMmu extends Module {
                         gWalking < 0,
                         gTranslated < 1,
                         walkArmed < 1,
-                        walkAddr < leafPa(wbDatMiso, gReqAddr),
+                        walkAddr < leafPa(wbDatMiso, gReqAddr, gWalkLevel),
                         weR < gSaveWe,
                         datMosiR < gSaveData,
                         selR < gSaveSel,
@@ -592,6 +634,7 @@ class RiverMmu extends Module {
                             ftlbValid < 1,
                             ftlbVpn < reqAddr.slice(xlen - 1, 12),
                             ftlbPte < pteWithAd,
+                            ftlbLevel < walkLevel,
                           ],
                           orElse: [
                             If(
@@ -600,6 +643,7 @@ class RiverMmu extends Module {
                                 dtlbValid < 1,
                                 dtlbVpn < reqAddr.slice(xlen - 1, 12),
                                 dtlbPte < pteWithAd,
+                                dtlbLevel < walkLevel,
                               ],
                             ),
                           ],
@@ -612,7 +656,7 @@ class RiverMmu extends Module {
                             // back to its address (walkAddr still holds the PTE
                             // pointer), then resume with the translated access.
                             adWrite < 1,
-                            adTransPa < leafPa(wbDatMiso, reqAddr),
+                            adTransPa < leafPa(wbDatMiso, reqAddr, walkLevel),
                             walkArmed < 1,
                             weR < 1,
                             datMosiR < pteWithAd,
@@ -621,7 +665,7 @@ class RiverMmu extends Module {
                           orElse: [
                             // A/D already set: arm the translated access directly.
                             walkArmed < 1,
-                            walkAddr < leafPa(wbDatMiso, reqAddr),
+                            walkAddr < leafPa(wbDatMiso, reqAddr, walkLevel),
                             weR < reqWe,
                             datMosiR < reqWdata,
                             // A fetch reads a full word; a dport uses its size.
@@ -800,7 +844,7 @@ class RiverMmu extends Module {
               isFetchWalk < 0,
               if (hasPaging)
                 If(
-                  pagingOn,
+                  dataPagingOn,
                   then: [
                     If(
                       dtlbHit,

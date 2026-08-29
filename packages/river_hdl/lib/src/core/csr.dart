@@ -80,8 +80,14 @@ class SimpleRwCsr extends CsrConfig {
 }
 
 class CounterCsr extends CsrConfig {
+  // mcycle/minstret are M-mode read/write per the privileged spec, so the
+  // access MUST be readWrite. The access also gates the backdoor write path:
+  // rohd_hcl runs every backdoor write value through Csr.getWriteData, which
+  // for a readOnly register returns the CURRENT value and drops the new data.
+  // With readOnly the per-cycle hardware increment (see _wireCounters) was
+  // silently discarded, so the counters stayed stuck at their reset value 0.
   CounterCsr(String name)
-    : super(name: name, access: CsrAccess.readOnly, fields: const []);
+    : super(name: name, access: CsrAccess.readWrite, fields: const []);
 }
 
 class RiscVCsrFile extends Module {
@@ -120,6 +126,10 @@ class RiscVCsrFile extends Module {
   CsrBackdoorInterface? _mcycleBd;
   CsrBackdoorInterface? _minstretBd;
 
+  // The live machine-timer value (CLINT mtime), read out for the `time` CSR
+  // (rdtime). Null when the SoC has no CLINT, in which case `time` is not added.
+  Logic? _timeIn;
+
   // Trap save-state / xRET restore controls (driven by core.dart). All
   // optional; when null the trap CSRs are not hardware-written (csrr/csrw work).
   Logic? _trapActive; // 1-cycle pulse: a synchronous trap is retiring
@@ -145,6 +155,9 @@ class RiscVCsrFile extends Module {
     int mhartid = 0,
     int rpipelineCap = 0,
     Logic? externalPending,
+    Logic? timerPending,
+    Logic? swPending,
+    Logic? timeIn,
     this.hasSupervisor = false,
     this.hasUser = false,
     this.hasPaging = false,
@@ -180,6 +193,19 @@ class RiscVCsrFile extends Module {
         externalPending,
         width: externalPending.width,
       );
+    }
+    // Machine timer/software interrupt-pending lines, driven by the CLINT
+    // (timer_irq = mtime>=mtimecmp -> mip.MTIP; sw_irq = msip -> mip.MSIP).
+    // Read-only to software, hardware-owned, mirroring externalPending -> MEIP.
+    if (timerPending != null) {
+      timerPending = addInput('timerPending', timerPending);
+    }
+    if (swPending != null) {
+      swPending = addInput('swPending', swPending);
+    }
+    // Live CLINT mtime, exposed to software through the read-only `time` CSR.
+    if (timeIn != null) {
+      _timeIn = addInput('timeIn', timeIn, width: timeIn.width);
     }
 
     _trapActive = trapActive == null
@@ -228,6 +254,8 @@ class RiscVCsrFile extends Module {
       addOutput('satp', width: mxlen.size);
       addOutput('sepc', width: mxlen.size);
       addOutput('sstatus', width: mxlen.size);
+      addOutput('sie', width: mxlen.size);
+      addOutput('sip', width: mxlen.size);
     }
 
     if (hasHypervisor) {
@@ -348,6 +376,10 @@ class RiscVCsrFile extends Module {
           _csrTop.getBackdoorPortsByAddr(0, CsrAddress.sepc.address).rdData!;
       output('sstatus') <=
           _csrTop.getBackdoorPortsByAddr(0, CsrAddress.sstatus.address).rdData!;
+      output('sie') <=
+          _csrTop.getBackdoorPortsByAddr(0, CsrAddress.sie.address).rdData!;
+      output('sip') <=
+          _csrTop.getBackdoorPortsByAddr(0, CsrAddress.sip.address).rdData!;
     }
 
     if (hasHypervisor) {
@@ -373,9 +405,18 @@ class RiscVCsrFile extends Module {
     }
 
     final mipBd = _csrTop.getBackdoorPortsByAddr(0, CsrAddress.mip.address);
-    if (externalPending != null) {
+    // Hardware owns the machine interrupt-pending bits: MEIP(11)<-externalPending,
+    // MTIP(7)<-timerPending, MSIP(3)<-swPending. Each is set from its line when
+    // present; the other mip bits (the WARL S-bits, if any) pass through the
+    // read-back value so a software write to them survives.
+    if (externalPending != null || timerPending != null || swPending != null) {
+      var mipNext = mip;
+      if (externalPending != null)
+        mipNext = mipNext.withSet(11, externalPending);
+      if (timerPending != null) mipNext = mipNext.withSet(7, timerPending);
+      if (swPending != null) mipNext = mipNext.withSet(3, swPending);
       mipBd.wrEn! <= Const(1);
-      mipBd.wrData! <= mip.withSet(11, externalPending);
+      mipBd.wrData! <= mipNext;
     } else {
       // Must still drive the backdoor write port: an undriven wrEn floats to X
       // and the CsrBlock's ElseIf(backdoorWrEn) corrupts mip to X.
@@ -516,6 +557,39 @@ class RiscVCsrFile extends Module {
         isBackdoorWritable: false,
       ),
 
+      // mcounteren: the machine counter-enable register. The privileged spec
+      // requires it when U-mode is implemented. It gates U-mode access to the
+      // cycle/time/instret counters. Only CY/TM/IR (bits 2:0) are writable, one
+      // per implemented counter; the HPM bits are WARL-0 (mask in
+      // _maskWriteData). Weir writes 0x7 to it during the S-mode handoff, and a
+      // Linux kernel likewise programs it, so an absent register would trap the
+      // write as illegal.
+      if (hasUser)
+        CsrInstanceConfig(
+          arch: SimpleRwCsr('mcounteren', mxlen.size),
+          addr: CsrAddress.mcounteren.address,
+          resetValue: 0,
+          width: mxlen.size,
+          isBackdoorWritable: false,
+        ),
+
+      // menvcfg: the machine environment-configuration register. The privileged
+      // spec requires it when S-mode is implemented. OpenSBI/Weir and Linux
+      // both read/write it (Sstc STCE, PBMTE, CBZE/CBIE, FIOM). River supports
+      // none of those features, so every field is WARL-0 (mask 0 in
+      // _maskWriteData): writes are dropped, reads return 0. That is the correct
+      // "feature absent" report - e.g. Linux's try_to_set_pmm reads PMM back as
+      // 0 and gracefully concludes pointer masking is unavailable. An ABSENT
+      // register would instead trap the access as illegal.
+      if (hasSupervisor)
+        CsrInstanceConfig(
+          arch: SimpleRwCsr('menvcfg', mxlen.size),
+          addr: CsrAddress.menvcfg.address,
+          resetValue: 0,
+          width: mxlen.size,
+          isBackdoorWritable: false,
+        ),
+
       // Smstateen machine-level state-enable CSRs. Only SE0 (bit 63) is writable
       // (masked in _maskWriteData); the access gating lives in the legality path.
       if (hasStateen)
@@ -610,6 +684,34 @@ class RiscVCsrFile extends Module {
         CsrInstanceConfig(
           arch: SimpleRwCsr('satp', mxlen.size),
           addr: CsrAddress.satp.address,
+          resetValue: 0,
+          width: mxlen.size,
+          isBackdoorWritable: false,
+        ),
+        // scounteren: the supervisor counter-enable register. The privileged
+        // spec requires it when S-mode is implemented. It gates U-mode access to
+        // the cycle/time/instret counters. Only CY/TM/IR (bits 2:0) are
+        // writable; the HPM bits are WARL-0 (mask in _maskWriteData). The Linux
+        // RISC-V head code writes it unconditionally, so an absent register
+        // traps the write as illegal and stops the kernel before start_kernel.
+        CsrInstanceConfig(
+          arch: SimpleRwCsr('scounteren', mxlen.size),
+          addr: CsrAddress.scounteren.address,
+          resetValue: 0,
+          width: mxlen.size,
+          isBackdoorWritable: false,
+        ),
+        // senvcfg: the supervisor environment-configuration register. Required
+        // when S-mode is implemented (priv spec 1.12+). Linux writes it from the
+        // context-switch path (envcfg_update_bits) and probes it in
+        // try_to_set_pmm/tagged_addr_init. River implements none of its features
+        // (Zicbo CBIE/CBCFE/CBZE, pointer-masking PMM, FIOM), so every field is
+        // WARL-0 (mask 0 in _maskWriteData): writes drop, reads return 0. That
+        // correctly reports "feature absent"; an ABSENT register would trap the
+        // csrw/csrr as illegal (fu_csr raises cause 2 on an unimplemented CSR).
+        CsrInstanceConfig(
+          arch: SimpleRwCsr('senvcfg', mxlen.size),
+          addr: CsrAddress.senvcfg.address,
           resetValue: 0,
           width: mxlen.size,
           isBackdoorWritable: false,
@@ -761,6 +863,10 @@ class RiscVCsrFile extends Module {
         resetValue: 0,
         isBackdoorWritable: true,
       ),
+
+      // NOTE: `time` (rdtime, 0xC01) is NOT registered as a CsrBlock CSR (that
+      // perturbs rohd_hcl's backdoor indexing). Its read legality and data are
+      // handled directly in _wireLegalityAndFrontdoor from the live CLINT mtime.
 
       // River custom cache control CSRs
       CsrInstanceConfig(
@@ -914,7 +1020,17 @@ class RiscVCsrFile extends Module {
   Logic _maskWriteData(Logic addr12, Logic data) {
     Logic out = data;
 
-    final vecMask = Const(0xFFFFFFFC, width: mxlen.size);
+    // *tvec BASE is the full XLEN address (bits [xlen-1:2]); only the 2-bit MODE
+    // field [1:0] is WARL (River implements direct=0). A 0xFFFFFFFC literal here
+    // truncated the base to 32 bits, so an RV64 high-virtual trap vector
+    // (0xffffffff8000xxxx, e.g. Linux relocate_enable_mmu's stvec) read back as
+    // its low 32 bits and the trampoline fault looped. Mask all base bits.
+    final vecMask = Const(
+      LogicValue.ofBigInt(
+        (BigInt.one << mxlen.size) - BigInt.from(4),
+        mxlen.size,
+      ),
+    );
     final fullMask = Const(~0, width: mxlen.size);
 
     Logic applyMask(int addr, Logic mask) {
@@ -943,9 +1059,36 @@ class RiscVCsrFile extends Module {
         Const(_sieSipMask, width: mxlen.size),
       );
       out = applyMask(CsrAddress.satp.address, fullMask);
+      // scounteren: only the counters River actually implements are writable
+      // (WARL). CY (bit0) and IR (bit2) are backed by mcycle/minstret, so they
+      // stay writable. TM (bit1) is WARL-0 because River has NO native `time`
+      // CSR wired to the CLINT mtime: the time CSR reads 0, so S-mode rdtime
+      // MUST keep trapping to the SBI (Weir) timer emulation, which reads the
+      // real mtime over the bus. Leaving TM writable let firmware's 0x7 write
+      // enable a direct S-mode read of the dead time CSR (always 0), which
+      // stalled systemd-boot's countdown timer forever. Mask = CY|IR = 0x5.
+      out = applyMask(
+        CsrAddress.scounteren.address,
+        Const(0x5, width: mxlen.size),
+      );
+      // senvcfg/menvcfg: River implements none of the envcfg-controlled features
+      // (Zicbo, pointer-masking, Sstc, Svpbmt), so all fields are WARL-0. Mask 0
+      // drops every write and the register reads back its reset value (0). This
+      // is the correct "feature absent" report and, crucially, makes Linux's
+      // try_to_set_pmm read PMM back as 0 and disable pointer masking instead of
+      // assuming a masking feature River does not actually provide.
+      out = applyMask(CsrAddress.senvcfg.address, Const(0, width: mxlen.size));
+      out = applyMask(CsrAddress.menvcfg.address, Const(0, width: mxlen.size));
     }
 
     if (hasUser) {
+      // mcounteren: same counter set as scounteren. TM (bit1) is WARL-0 (no
+      // native `time` CSR; rdtime is SBI-emulated), CY|IR stay writable. See the
+      // scounteren note above. Weir writes 0x7 here, TM lands as 0.
+      out = applyMask(
+        CsrAddress.mcounteren.address,
+        Const(0x5, width: mxlen.size),
+      );
       out = applyMask(
         CsrAddress.ustatus.address,
         Const(_ustatusMask, width: mxlen.size),
@@ -1014,8 +1157,18 @@ class RiscVCsrFile extends Module {
     rdAddr12 <= vsRedirect(csrRead.addr.slice(11, 0), 'rd');
     wrAddr12 <= vsRedirect(csrWrite.addr.slice(11, 0), 'wr');
 
+    // `time` (0xC01) is served from the live CLINT mtime, not the CsrBlock, so
+    // it is legal to read (at any privilege, U-level CSR) whenever mtime is
+    // wired. Its data is muxed in below.
+    final isTimeRd = (_timeIn == null)
+        ? Const(0)
+        : rdAddr12
+              .eq(Const(CsrAddress.time.address, width: 12))
+              .named('csrIsTime');
     final rdLegal =
-        _addrExists(rdAddr12) & _privOk(rdAddr12) & _stateenOk(rdAddr12);
+        (_addrExists(rdAddr12) | isTimeRd) &
+        _privOk(rdAddr12) &
+        _stateenOk(rdAddr12);
     // _isFrontdoorWritable is a strict subset of _addrExists (same register
     // list, readWrite regs only), so it implies _addrExists. Dropping the
     // redundant existence term removes the _addrExists OR-tree from
@@ -1027,7 +1180,14 @@ class RiscVCsrFile extends Module {
 
     _fdRead.addr <= rdAddr12;
     _fdRead.en <= csrRead.en & rdLegal;
-    csrRead.data <= _fdRead.data;
+    // `time` (rdtime) returns the live CLINT mtime, not a stored register, so the
+    // OS clocksource tracks the same counter its timer events compare against.
+    if (_timeIn != null) {
+      csrRead.data <=
+          mux(isTimeRd, _timeIn!.getRange(0, mxlen.size), _fdRead.data);
+    } else {
+      csrRead.data <= _fdRead.data;
+    }
     csrRead.done <= csrRead.en;
     csrRead.valid <= csrRead.en & rdLegal;
 
@@ -1230,6 +1390,8 @@ class RiscVCsrFile extends Module {
 
   Logic? get stvec => hasSupervisor ? output('stvec') : null;
   Logic? get sstatus => hasSupervisor ? output('sstatus') : null;
+  Logic? get sie => hasSupervisor ? output('sie') : null;
+  Logic? get sip => hasSupervisor ? output('sip') : null;
   Logic? get hstatus => hasHypervisor ? output('hstatus') : null;
   Logic? get hedeleg => hasHypervisor ? output('hedeleg') : null;
   Logic? get vstvec => hasHypervisor ? output('vstvec') : null;

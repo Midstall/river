@@ -92,6 +92,13 @@ class DeviceParams {
   /// HarborDdrController + DdrSequencer/DdrPhyXilinx. Implies ddr3Fast.
   final bool? ddr3v2;
 
+  /// DDR3 controller-logic gearing (ddr3v2 only). 1 (absent) = the controller
+  /// runs on CK/4 (byte-identical to today). 2 = the CK/8 gearbox controller:
+  /// the DDR MMCM emits CLKOUT5 as CK/8, HarborDdr3 interposes the fabric 2:1
+  /// gearbox, and the congestion-limited command scheduler gets timing margin
+  /// on a dense open-tools part while DDR CK stays at full speed.
+  final int? ctrlGear;
+
   /// Open the ddr3Fast read window from the DRAM's read strobe (DQS as data) so
   /// each read self-frames, instead of a fixed CL tap that mis-frames under the
   /// i+d cadence. ddr3Fast only.
@@ -128,6 +135,44 @@ class DeviceParams {
   /// Built-in firmware program baked into flash (e.g. `hexdump`).
   final String? program;
 
+  // --- spi/sdio device ---
+
+  /// Board connector this device's pads bind to (e.g. `iface=pmod@ja`). Resolved
+  /// against the selected [HarborBoard]'s `interfaces` catalog, so the SoC need
+  /// not hand-enter the connector's pin sites. Used by the `spi` device.
+  final String? iface;
+
+  /// An SD/MMC card is wired to this SPI controller (CS0, SPI mode). genip then
+  /// has Harbor emit an `mmc-spi-slot` device-tree child so Linux binds the
+  /// in-tree `mmc_spi` driver and exposes a mountable block device.
+  final bool? sdcard;
+
+  /// Number of hardware execute-breakpoint triggers on a `debug-jtag` device.
+  /// 0/absent = none (byte-identical to before). OpenOCD programs these over
+  /// JTAG so it can breakpoint even hot, I-cached code without patching it.
+  final int? triggers;
+
+  /// Give this `spi` device an integrated DMA engine: a second fabric master
+  /// that streams SD bytes straight to memory (no per-byte CPU poll). absent/
+  /// false = byte-identical slave-only PIO. Firmware finds it via the device's
+  /// `dma` device-tree/ACPI property.
+  final bool? dma;
+
+  /// Put the DMA master on the PRIMARY fabric channel (shared crossbar with the
+  /// core) instead of its own `dma` channel. The separate channel lifts the
+  /// wide DMA leg off the primary crossbar, but on a small device it adds a
+  /// second crossbar plus a converge arbiter that becomes the routing hotspot;
+  /// sharing is the topology that provably closes on xc7s50. Costs DMA/CPU
+  /// fabric contention. absent/false = the separate `dma` channel.
+  final bool? dmaShared;
+
+  /// Sample the SDIO read DAT lines on the SD clock FALLING edge (half a period
+  /// later) instead of the rising edge. Gives the card-to-host round-trip more
+  /// settle time, the fix for marginal read capture at speed on a real board.
+  /// It is also a runtime CTRL[8] bit, so this only sets the reset default.
+  /// absent/false = rising-edge sample (the standard host default).
+  final bool? sampleFall;
+
   const DeviceParams({
     this.trainable,
     this.runtimeTrain,
@@ -145,6 +190,7 @@ class DeviceParams {
     this.mpr,
     this.ddr3Fast,
     this.ddr3v2,
+    this.ctrlGear,
     this.dqsGate,
     this.readClExtra,
     this.clockFreq,
@@ -152,6 +198,12 @@ class DeviceParams {
     this.mode,
     this.path,
     this.program,
+    this.iface,
+    this.sdcard,
+    this.triggers,
+    this.dma,
+    this.dmaShared,
+    this.sampleFall,
   });
 
   /// Accepted param keys (case-insensitive), for error messages.
@@ -172,6 +224,7 @@ class DeviceParams {
     'mpr',
     'ddr3fast',
     'ddr3v2',
+    'ctrlgear',
     'dqsgate',
     'readclextra',
     'clockfreq',
@@ -179,6 +232,12 @@ class DeviceParams {
     'mode',
     'path',
     'program',
+    'iface',
+    'sdcard',
+    'triggers',
+    'dma',
+    'dmashared',
+    'samplefall',
   ];
 
   static bool _parseBool(String v) {
@@ -217,6 +276,7 @@ class DeviceParams {
     bool? mpr;
     bool? ddr3Fast;
     bool? ddr3v2;
+    int? ctrlGear;
     bool? dqsGate;
     int? readClExtra;
     int? clockFreq;
@@ -224,6 +284,12 @@ class DeviceParams {
     String? mode;
     String? path;
     String? program;
+    String? iface;
+    bool? sdcard;
+    int? triggers;
+    bool? dma;
+    bool? dmaShared;
+    bool? sampleFall;
     for (final pair in s.split(',')) {
       final eq = pair.indexOf('=');
       if (eq < 0) {
@@ -267,6 +333,11 @@ class DeviceParams {
           ddr3Fast = _parseBool(val);
         case 'ddr3v2':
           ddr3v2 = _parseBool(val);
+        case 'ctrlgear':
+          ctrlGear = int.parse(val);
+          if (ctrlGear != 1 && ctrlGear != 2) {
+            throw FormatException('ctrlgear must be 1 or 2, got: $val');
+          }
         case 'dqsgate':
           dqsGate = _parseBool(val);
         case 'readclextra':
@@ -286,6 +357,18 @@ class DeviceParams {
           path = val;
         case 'program':
           program = val;
+        case 'iface':
+          iface = val;
+        case 'sdcard':
+          sdcard = _parseBool(val);
+        case 'triggers':
+          triggers = int.parse(val);
+        case 'dma':
+          dma = _parseBool(val);
+        case 'dmashared':
+          dmaShared = _parseBool(val);
+        case 'samplefall':
+          sampleFall = _parseBool(val);
         default:
           throw FormatException(
             'Unknown device param "$key"; accepted: ${_keys.join(', ')}',
@@ -309,6 +392,7 @@ class DeviceParams {
       mpr: mpr,
       ddr3Fast: ddr3Fast,
       ddr3v2: ddr3v2,
+      ctrlGear: ctrlGear,
       dqsGate: dqsGate,
       readClExtra: readClExtra,
       clockFreq: clockFreq,
@@ -316,6 +400,12 @@ class DeviceParams {
       mode: mode,
       path: path,
       program: program,
+      iface: iface,
+      sdcard: sdcard,
+      triggers: triggers,
+      dma: dma,
+      dmaShared: dmaShared,
+      sampleFall: sampleFall,
     );
   }
 }
@@ -440,11 +530,16 @@ class DeviceEntry {
   final int address;
   final String? compatible;
 
+  /// Trailing `key=val` tuning params carried over from the unified device, so
+  /// peripheral construction can read them (e.g. the `spi` device's `sdcard`).
+  final DeviceParams? params;
+
   const DeviceEntry({
     required this.name,
     required this.type,
     required this.address,
     this.compatible,
+    this.params,
   });
 
   /// Parses `[name=]type:addr[:compat]`.
@@ -670,6 +765,20 @@ sealed class Target {
 
   static Target parse(String spec) {
     final parts = spec.split(':');
+    // Verilator simulation target: `verilator`, optionally `verilator:trace`.
+    // It has no device or package, so it is handled before the
+    // vendor:device:package arity check below.
+    if (parts[0] == 'verilator' || parts[0] == 'sim') {
+      // `verilator[:trace][:threads=N]`. threads is the run-time thread count
+      // of the Verilated model; omit it for the single-threaded default.
+      var simThreads = 1;
+      for (final p in parts) {
+        if (p.startsWith('threads=')) {
+          simThreads = int.parse(p.substring('threads='.length));
+        }
+      }
+      return SimTarget(trace: parts.contains('trace'), threads: simThreads);
+    }
     if (parts.length < 2) {
       throw FormatException(
         'Target format: vendor:device[:package], got: $spec',
@@ -766,6 +875,57 @@ class FpgaTarget extends Target {
         throw UnsupportedError('Unknown FPGA vendor: $vendor');
     }
   }
+}
+
+/// Verilator simulation target. Selected with `--target verilator` (or
+/// `verilator:trace`). It maps to Harbor's [HarborSimTarget], which drives the
+/// Verilator build emission in `HarborSoC.generateAll` (the C++ harness
+/// `sim/main.cpp`, the Verilator `Makefile`, and the remote_bitbang OpenOCD
+/// config). Un-Verilatable vendor IP (the DDR PHY, config-JTAG primitives)
+/// swaps to a behavioral body under this target, and the debug TAP is exposed
+/// as real top-level pins for the harness to bit-bang, so no config-JTAG tunnel.
+class SimTarget extends Target {
+  /// Emit FST waveform tracing (opt-in; a large run-time cost).
+  final bool trace;
+
+  /// Verilator `--trace-depth`, ignored when [trace] is false.
+  final int traceDepth;
+
+  /// Optimisation level for Verilator and the generated C++.
+  final int optLevel;
+
+  /// Extra Verilator warnings to suppress on top of Harbor's defaults.
+  final List<String> extraWarningsOff;
+
+  /// Run-time thread count of the Verilated model (`--threads`). 1 keeps the
+  /// single-threaded model; above 1 partitions the sim across host threads.
+  final int threads;
+
+  const SimTarget({
+    this.trace = false,
+    this.traceDepth = 99,
+    this.optLevel = 3,
+    this.extraWarningsOff = const [],
+    this.threads = 1,
+  });
+
+  @override
+  HarborDeviceTarget toHarborTarget({
+    required String topCell,
+    required int frequency,
+    // Verilator has no pins, constraints, or PDK; those are ignored.
+    Map<String, String> pins = const {},
+    Map<String, String> extraConstraints = const {},
+    String? pdkRoot,
+  }) => HarborSimTarget(
+    topCell: topCell,
+    frequency: frequency,
+    trace: trace,
+    traceDepth: traceDepth,
+    optLevel: optLevel,
+    extraWarningsOff: extraWarningsOff,
+    threads: threads,
+  );
 }
 
 // TODO: replace with the harbor target class
@@ -975,6 +1135,7 @@ class RiverGenIpConfig {
           type: d.type,
           address: d.address!,
           compatible: d.compatible,
+          params: d.params,
         ),
   ];
 
@@ -1018,6 +1179,11 @@ class RiverGenIpConfig {
   /// True when a `debug-jtag` device is present: wire the JTAG debug subsystem
   /// (TAP+DTM+DM+SBA) as a second fabric master and build the core with debug.
   bool get enableDebug => _firstDeviceOfType('debug-jtag') != null;
+
+  /// Number of hardware execute-breakpoint triggers requested on the debug-jtag
+  /// device (`debug-jtag:triggers=N`). 0 when absent.
+  int get debugTriggers =>
+      _firstDeviceOfType('debug-jtag')?.params?.triggers ?? 0;
 
   // --- flash-firmware (derived from a `flash-firmware` device) ---
 
@@ -1117,6 +1283,9 @@ class RiverGenIpConfig {
     'rc1-mi': RiverCoreConfigV1.micro,
     'rc1-s': RiverCoreConfigV1.small,
     'rc1-m': RiverCoreConfigV1.macro,
+    // River Core V1 Full: the full ISA with the F/D FPU. This is the core the
+    // Delta SoC family carries, so a stock rv64gc/lp64d NixOS runs.
+    'rc1-f': RiverCoreConfigV1.full,
   };
 
   RiscVMxlen get mxlen {
@@ -1231,13 +1400,75 @@ class RiverGenIpConfig {
   /// entries become device bindings, the rest are simple constraint pins.
   List<PinAssignment> get effectivePins {
     final b = board;
-    if (b == null) return pins;
-    final userNames = {for (final p in pins) p.externalName};
-    return [
-      for (final e in b.pins.entries)
-        if (!userNames.contains(e.key)) _boardPinAssignment(e.key, e.value),
-      ...pins,
-    ];
+    final catalog = b == null
+        ? pins
+        : [
+            for (final e in b.pins.entries)
+              if (!{for (final p in pins) p.externalName}.contains(e.key))
+                _boardPinAssignment(e.key, e.value),
+            ...pins,
+          ];
+    return [...catalog, ..._ifacePins];
+  }
+
+  /// SPI role -> the HarborSpiController pad each connector role drives. The
+  /// board connector bakes the wiring convention (e.g. Digilent Pmod-SPI), so
+  /// this is a fixed role vocabulary the `spi` device consumes.
+  static const _spiIfaceRoleToPort = {
+    'cs': 'spi_cs_n',
+    'mosi': 'spi_mosi',
+    'miso': 'spi_miso',
+    'sck': 'spi_clk',
+  };
+
+  /// Device-bound pin assignments synthesised from a device's `iface=<name>`.
+  /// Each `spi` device with an interface binds its four pads to the named board
+  /// connector's `cs`/`mosi`/`miso`/`sck` sites. The external pin name is
+  /// prefixed with the device name so it never collides with the config-flash
+  /// SPI pads (which also expose `spi_cs_n`).
+  List<PinAssignment> get _ifacePins {
+    final out = <PinAssignment>[];
+    for (final dev in devices) {
+      final ifaceName = dev.params?.iface;
+      if (ifaceName == null) continue;
+      if (dev.type != 'spi') {
+        throw ArgumentError(
+          'iface= is only supported on `spi` devices, not "${dev.type}"',
+        );
+      }
+      final b = board;
+      if (b == null) {
+        throw ArgumentError(
+          'device "${dev.name}" has iface=$ifaceName but no --board is set to '
+          'resolve the connector; add board=<name> to the SoC',
+        );
+      }
+      final conn = b.interfaces[ifaceName];
+      if (conn == null) {
+        throw ArgumentError(
+          'board "${b.name}" has no interface "$ifaceName"; '
+          'known: ${b.interfaces.keys.join(', ')}',
+        );
+      }
+      _spiIfaceRoleToPort.forEach((role, port) {
+        final site = conn[role];
+        if (site == null) {
+          throw ArgumentError(
+            'interface "$ifaceName" on board "${b.name}" is missing the SPI '
+            'role "$role" (need cs/mosi/miso/sck)',
+          );
+        }
+        out.add(
+          PinAssignment(
+            externalName: '${dev.name}_$role',
+            deviceName: dev.name,
+            portName: port,
+            fpgaPin: site,
+          ),
+        );
+      });
+    }
+    return out;
   }
 
   Map<String, String> get fpgaPinMap => {
@@ -1299,13 +1530,26 @@ class RiverGenIpConfig {
     // never leaves reset. Fold the core clock onto a spare CLKOUT of the DDR3
     // MMCM instead (one MMCM on the pin). A separate `ddr_osc` pin has no
     // contention and keeps its own core MMCM.
-    final useDdr3TreeCoreClk = ddr3Fast && ddrOscFrequency == null;
+    // Under Verilator there is no Xilinx MMCM/PLL to build the DDR3 clock tree
+    // (BUFG/PLLE2_ADV have no sim model), and the behavioral DRAM runs off the
+    // plain bus clock, so never hang the core clock off a DDR tree in sim: fall
+    // back to the behavioral clock generation like a boardless SoC.
+    final useDdr3TreeCoreClk =
+        ddr3Fast && ddrOscFrequency == null && effectiveTarget is! SimTarget;
+    // DDR controller gearing (shared tree): the CK/8 gearbox controller when any
+    // ddr3v2 DRAM sets ctrlgear=2. One tree serves every controller, so they use
+    // one gearRatio (the per-device HarborDdr3 controllerGearRatio matches it).
+    final ddrGearRatio = memories
+        .where((m) => m.ddrParams?.ddr3v2 ?? false)
+        .map((m) => m.ddrParams?.ctrlGear ?? 1)
+        .fold<int>(1, (a, b) => b > a ? b : a);
     final xilinxDdr3Tree = useDdr3TreeCoreClk
         ? XilinxDdr3TreeSpec(
             sourceHz: oscFrequency,
             ddrCkHz: ddrClockFrequency ?? 333333333,
             coreClkHz: clockFrequency,
             dqsPhaseDeg: 180.0,
+            ddrGearRatio: ddrGearRatio,
           )
         : null;
     final coreClock = HarborClockConfig(
@@ -1338,10 +1582,15 @@ class RiverGenIpConfig {
 
     final soc = HarborSoC(
       name: name,
-      compatible: 'midstall,${name.replaceAll('_', '-')}',
+      compatible: 'lilith,${name.replaceAll('_', '-')}',
       busConfig: busConfig,
-      acpiOemId: 'MIDSTL',
+      acpiOemId: 'LILSMI',
       acpiOemTableId: 'RIVER',
+      // An FPGA target normally resets only at configuration (power-on). A
+      // `reset_n=<pad>` pin (e.g. a board RESET button) adds an active-low
+      // external reset ORed into that POR, so a press restarts the SoC. The
+      // pad is constrained by the generic pin loop; here we just enable the port.
+      externalReset: pins.any((p) => p.externalName == 'reset_n'),
       cpus: coreConfigs
           .map(
             (coreConfig) => HarborCpu(
@@ -1425,16 +1674,43 @@ class RiverGenIpConfig {
       ],
     );
 
+    // The CLINT (if present) drives each hart's machine timer/software interrupt
+    // lines. The core is built before the peripherals, so make a net per hart
+    // now, feed it to the core, and connect the CLINT output to it after the
+    // peripheral loop below.
+    final hasClint = mmioDevices.any((d) => d.type == 'clint');
+    final coreTimerNets = <Logic>[];
+    final coreSwNets = <Logic>[];
+    final coreTimeNets = <Logic>[];
+
     RiverCore? debugCore;
+    var hartIndex = 0;
     for (final coreConfig in coreConfigs) {
+      Logic? timerNet;
+      Logic? swNet;
+      Logic? timeNet;
+      if (hasClint) {
+        timerNet = Logic(name: 'core${hartIndex}_timer_pending');
+        swNet = Logic(name: 'core${hartIndex}_sw_pending');
+        // The 64-bit CLINT mtime, fed to the core's `time` CSR (rdtime).
+        timeNet = Logic(name: 'core${hartIndex}_time', width: 64);
+        coreTimerNets.add(timerNet);
+        coreSwNets.add(swNet);
+        coreTimeNets.add(timeNet);
+      }
       final core = RiverCore(
         coreConfig,
         busConfig: busConfig,
         target: target,
         withDebug: enableDebug,
+        debugTriggers: enableDebug ? debugTriggers : 0,
+        timerPending: timerNet,
+        swPending: swNet,
+        timeIn: timeNet,
       );
       soc.addMaster(core, busInterfaceName: 'dataBus');
       debugCore ??= core;
+      hartIndex++;
     }
 
     // Boot ROM. The hello-world demo bakes the application directly into the
@@ -1477,6 +1753,41 @@ class RiverGenIpConfig {
       final mem = memories[i];
       final board = mem.ddrBoard;
       if (board != null && ddr3Fast) {
+        // Verilator: HarborDdr3 builds a behavioral DRAM (_HarborSimDram) on the
+        // bus/sys clock, loaded at runtime via +dram_image=<hex>. It has no DDR3
+        // clock tree (PLLE2/BUFG, which have no sim model) and no PHY pads, so
+        // skip all of that FPGA plumbing and just add it as a bus slave. The
+        // clock/period values are ignored by the behavioral body.
+        if (target is HarborSimTarget && (mem.ddrParams?.ddr3v2 ?? false)) {
+          final ddr = HarborDdr3(
+            config: board.config,
+            baseAddress: mem.address,
+            clockHz: clockFrequency,
+            busAddressWidth: busConfig.addressWidth,
+            busDataWidth: busConfig.dataWidth,
+            target: target,
+            ckPeriodPs: 1250,
+            runtimeTrainable: false,
+            simExternalMem: true,
+            name: '${mem.type}_$i',
+          );
+          soc.addPeripheral(ddr);
+          // The behavioral DRAM is a host-side C++ mmap model, so route its
+          // wishbone memory bus to the top for the model to drive, the same
+          // split-port exposure the SDIO card model uses.
+          for (final p in const [
+            'mem_stb',
+            'mem_we',
+            'mem_adr',
+            'mem_dat_w',
+            'mem_sel',
+            'mem_ack',
+            'mem_dat_r',
+          ]) {
+            soc.exposePin(ddr, p, externalName: '${ddr.name}_$p');
+          }
+          continue;
+        }
         // Real-speed DDR3-667 (Xilinx ISERDESE2).
         // Build the DDR3 clock tree from the board oscillator: an MMCM (ZHOLD +
         // BUFG feedback, the only openXC7-lockable form) fans one VCO into ck333
@@ -1514,6 +1825,11 @@ class RiverGenIpConfig {
         // (single-oscillator core-clock-off-spare-CLKOUT path), reuse it so the
         // core and the DDR clocks share ONE MMCM. Otherwise build it here (the
         // separate `ddr_osc` pin case has no clock-pin contention).
+        // DDR controller gearing for THIS dram device (ddr3v2 only). Must match
+        // whatever the shared SoC tree was built with.
+        final ddrGear = (mem.ddrParams?.ddr3v2 ?? false)
+            ? (mem.ddrParams?.ctrlGear ?? 1)
+            : 1;
         final tree =
             soc.xilinxDdr3Clocks ??
             buildXilinxDdr3ClockTree(
@@ -1523,6 +1839,7 @@ class RiverGenIpConfig {
               ddrCkHz: ck333Hz,
               idelayRefHz: idelayRefHz,
               dqsPhaseDeg: dqsPhaseDeg,
+              ddrGearRatio: ddrGear,
               name: 'ddr3clk',
             );
         // Controller clock = ctrl83 (CK/4). All DRAM us/ns timing counters derive
@@ -1563,6 +1880,26 @@ class RiverGenIpConfig {
             // Match the DDR3 CK the tree actually solves (set clockfreq=
             // 300000000 on the device for the proven 300 MHz x16 point).
             ckPeriodPs: (1e6 / tree.ddrCkMhz).round(),
+            // ctrlgear=2: run the controller LOGIC on the tree's CK/8 clock
+            // (controllerClkPeriodPs = CK*4*gear -> the AC-timing counts are
+            // CK/8-correct, T6) and interpose the fabric gearbox.
+            controllerGearRatio: ddrGear,
+            // Strictly-ordered (non-posted) DRAM writes: a write is not ACKed to
+            // the fabric until it has crossed and committed. This buys two things,
+            // BOTH HW-proven necessary on the timing-marginal Arty S7 DDR:
+            //   1. Cross-master coherency: a later read by ANY master (CPU or SDIO
+            //      ADMA) sees the write. Posted writes ACK early and leave a stale
+            //      hole that QEMU + the functional ROHD sim never reproduce.
+            //   2. ADMA pacing: each ADMA card-read block-write waits for its
+            //      commit, which throttles the sustained read to a rate the
+            //      marginal DDR survives. Posted writes remove that pacing; the
+            //      unthrottled ADMA over-stresses the DDR and the board RESETS
+            //      mid-read (HW-verified 2026-08-15: a posted build resets at the
+            //      boot-file read where this non-posted build loads the kernel).
+            // Costs CPU write throughput (~220-cycle commit per store), which the
+            // real fix (a fast, non-marginal DDR route, or per-master posted so
+            // only the ADMA is paced) would recover. See project #68.
+            postedWrites: false,
             // train=runtime exposes the knob-ABI window for the FSBL engine.
             runtimeTrainable: mem.ddrParams?.runtimeTrain ?? false,
             name: '${mem.type}_$i',
@@ -1577,19 +1914,34 @@ class RiverGenIpConfig {
               BusAddressRange(ddr.trainBase, HarborDdr3.trainWindowSize),
             );
           }
-          ddr.input('ddr_clk').srcConnection! <= tree.controller;
-          final sysDomainForDdr = soc.clockDomain('sys');
-          if (sysDomainForDdr == null) {
-            throw StateError('ddr3v2 needs the sys clock domain for ddr_reset');
-          }
-          ddr.input('ddr_reset').srcConnection! <= sysDomainForDdr.reset;
-          ddr.input('ddr_ck_fast').srcConnection! <= tree.ddrCk;
-          ddr.input('ddr_ck90_fast').srcConnection! <= tree.ddrCk90;
-          ddr.input('ddr_ck_dqs_fast').srcConnection! <= tree.ddrCkDqs;
-          ddr.input('ddr_idelay_ref').srcConnection! <= tree.idelayRef;
-          final padPorts = [...DdrBoard.padPorts, 'sdram_dqs_n'];
-          for (final pad in padPorts) {
-            soc.exposePin(ddr, pad, externalName: pad);
+          // Under Verilator, HarborDdr3 builds a behavioral DRAM (_HarborSimDram,
+          // loadable via +dram_image) with only the bus + clk/reset, and NO DDR3
+          // PHY: no ddr_clk/ck_fast inputs and no physical pads. So the whole PHY
+          // wiring and pad exposure below is FPGA/ASIC only. The bus side and
+          // clk/reset are auto-wired by addPeripheral for both.
+          if (target is! HarborSimTarget) {
+            // gearRatio 1: single clock (ddr_clk = CK/4). gearRatio 2: the
+            // controller runs on CK/8 (tree.controllerClk = CLKOUT5) and the
+            // SERDES/PHY + gearbox on CK/4 (tree.controller) via ddr_serdes_clk.
+            ddr.input('ddr_clk').srcConnection! <= tree.controllerClk;
+            if (ddrGear > 1) {
+              ddr.input('ddr_serdes_clk').srcConnection! <= tree.controller;
+            }
+            final sysDomainForDdr = soc.clockDomain('sys');
+            if (sysDomainForDdr == null) {
+              throw StateError(
+                'ddr3v2 needs the sys clock domain for ddr_reset',
+              );
+            }
+            ddr.input('ddr_reset').srcConnection! <= sysDomainForDdr.reset;
+            ddr.input('ddr_ck_fast').srcConnection! <= tree.ddrCk;
+            ddr.input('ddr_ck90_fast').srcConnection! <= tree.ddrCk90;
+            ddr.input('ddr_ck_dqs_fast').srcConnection! <= tree.ddrCkDqs;
+            ddr.input('ddr_idelay_ref').srcConnection! <= tree.idelayRef;
+            final padPorts = [...DdrBoard.padPorts, 'sdram_dqs_n'];
+            for (final pad in padPorts) {
+              soc.exposePin(ddr, pad, externalName: pad);
+            }
           }
           continue;
         }
@@ -1947,6 +2299,100 @@ class RiverGenIpConfig {
       }
     }
 
+    // Wire the CLINT's per-hart timer_irq/sw_irq outputs into each core's
+    // machine timer/software interrupt-pending lines (mip.MTIP / mip.MSIP), the
+    // same output-drives-input idiom the debug subsystem uses below. Without
+    // this the CLINT outputs dangle and a Linux/SBI timer never fires.
+    if (hasClint && coreTimerNets.isNotEmpty) {
+      final clintDev = mmioDevices.firstWhere((d) => d.type == 'clint');
+      final clint = peripheralsByName[clintDev.name]!;
+      for (var h = 0; h < coreTimerNets.length; h++) {
+        coreTimerNets[h] <= clint.output('timer_irq_$h');
+        coreSwNets[h] <= clint.output('sw_irq_$h');
+        coreTimeNets[h] <= clint.output('mtime_val');
+      }
+    }
+
+    // A DMA-capable SPI controller is BOTH a slave (its registers, added above)
+    // and a bus master (its `dma` interface streams SD bytes to memory). Attach
+    // that master to the fabric arbiter alongside the core. Its leg is pipelined
+    // because the SPI sits out at an I/O pad: a registered bus to the arbiter
+    // keeps the placer from stretching a die-crossing combinational route
+    // through the core's decode region (routing-congestion relief). The DMA is
+    // throughput-bound, so the two extra latency cycles do not matter.
+    for (final dev in mmioDevices) {
+      if ((dev.type == 'spi' || dev.type == 'sdio') &&
+          (dev.params?.dma ?? false)) {
+        soc.addMaster(
+          peripheralsByName[dev.name]!,
+          busInterfaceName: 'dma',
+          pipeline: true,
+          // Put the DMA master on its OWN fabric channel, physically off the
+          // primary arbiter. Its wide 64-bit leg was the delta xc7s50 routing
+          // hotspot (it smeared the crossbar's arbitration mux through the
+          // core's decode region); on its own channel it meets the CPU fabric
+          // only at a converge arbiter in front of DRAM. Also the Linux
+          // topology: DMA traffic never stalls the CPU's primary fabric.
+          // With dmashared, the separate channel plus its converge arbiter is
+          // itself the routing hotspot on a small device, so share the primary
+          // crossbar instead (the topology that provably closes on xc7s50).
+          channel: (dev.params?.dmaShared ?? false) ? 'primary' : 'dma',
+        );
+      }
+    }
+
+    // Expose the SDIO controller's SD pads. CMD/DAT are bidirectional (ownPads
+    // inout, driven through IOBUFs inside the controller); clk is an output and
+    // card-detect an input. Board pins bind to these by external name.
+    for (final dev in mmioDevices) {
+      if (dev.type == 'sdio') {
+        final sdio = peripheralsByName[dev.name]!;
+        final pads = target is HarborSimTarget
+            // Verilator (ownPads=false): the split out/oe/in ports, so the C++
+            // SD-card sim model reads the host's cmd/dat drive and injects the
+            // card's response/data on the `_in` lines.
+            ? const [
+                'sd_clk',
+                'sd_cd',
+                'sd_cmd_out',
+                'sd_cmd_oe',
+                'sd_cmd_in',
+                'sd_dat_out',
+                'sd_dat_oe',
+                'sd_dat_in',
+              ]
+            // FPGA/ASIC (ownPads=true): one scalar inout pad per DAT lane
+            // (sd_dat0..3) plus cmd/clk/cd.
+            : const [
+                'sd_clk',
+                'sd_cmd',
+                'sd_cd',
+                'sd_dat0',
+                'sd_dat1',
+                'sd_dat2',
+                'sd_dat3',
+              ];
+        for (final pad in pads) {
+          soc.exposePin(sdio, pad, externalName: '${dev.name}_$pad');
+        }
+      }
+    }
+
+    // Under Verilator the UART has no board pin, so its serial lines are not
+    // exposed by --pin. Expose tx/rx as real top-level ports so the harness's
+    // host-side UART sink (HarborUart.simModels, gated on topPort('tx')) can
+    // decode the transmit line to stdout, the same way the JTAG pins are raised
+    // for the remote_bitbang server. Mirrors the console a board gives us.
+    if (target is HarborSimTarget) {
+      for (final dev in mmioDevices) {
+        if (dev.type != 'uart') continue;
+        final uart = peripheralsByName[dev.name]!;
+        for (final line in const ['tx', 'rx']) {
+          soc.exposePin(uart, line, externalName: '${dev.name}_$line');
+        }
+      }
+    }
+
     // Expose peripheral pins referenced by --pin flags (and the board catalog).
     for (final pin in effectivePins) {
       if (!pin.isDevicePin) continue;
@@ -1957,6 +2403,35 @@ class RiverGenIpConfig {
         );
       }
       soc.exposePin(peri, pin.portName, externalName: pin.externalName);
+    }
+
+    // Build the fabric. When a DMA-capable device placed a master on the 'dma'
+    // channel (see addMaster above), keep that channel separate: it reaches only
+    // memory (dram) and converges with the primary channel at an arbiter in
+    // front of DRAM. This lifts the DMA's wide master off the primary crossbar
+    // (delta xc7s50 congestion relief) and is the Linux-throughput topology.
+    // Without a DMA channel this is byte-identical to the historic single fabric.
+    void finishFabric() {
+      final hasDmaChannel = mmioDevices.any(
+        (dev) =>
+            (dev.type == 'spi' || dev.type == 'sdio') &&
+            (dev.params?.dma ?? false) &&
+            !(dev.params?.dmaShared ?? false),
+      );
+      if (!hasDmaChannel) {
+        soc.buildFabric(pipeline: true);
+        return;
+      }
+      soc.buildFabric(
+        pipeline: true,
+        channelSlaves: {
+          'primary': {for (final p in soc.peripherals) p.name},
+          'dma': {
+            for (final p in soc.peripherals)
+              if (p.name.startsWith('dram')) p.name,
+          },
+        },
+      );
     }
 
     if (usbDfu && usbDfuMode == UsbDfuMode.hardware) {
@@ -1974,10 +2449,10 @@ class RiverGenIpConfig {
     } else if (usbDfu && usbDfuMode == UsbDfuMode.software) {
       _integrateUsbDfuSoftware(soc, busConfig, target);
       if (enableDebug) _integrateDebugJtag(soc, busConfig, debugCore!, target);
-      soc.buildFabric();
+      finishFabric();
     } else {
       if (enableDebug) _integrateDebugJtag(soc, busConfig, debugCore!, target);
-      soc.buildFabric();
+      finishFabric();
     }
 
     return soc;
@@ -1995,6 +2470,22 @@ class RiverGenIpConfig {
     final xlen = busConfig.dataWidth;
     final dbg = RiverDebugSubsystem(busConfig, xlen: xlen, target: target);
     soc.addMaster(dbg, busInterfaceName: 'bus');
+
+    // Under Verilator the TAP is not tunnelled through a config-JTAG
+    // primitive, so its pins are real top-level ports for the generated
+    // remote_bitbang server to bit-bang. Names must match the harness that
+    // HarborSimTarget.generateMain emits.
+    if (target is HarborSimTarget) {
+      for (final pin in const [
+        'jtag_tck',
+        'jtag_tms',
+        'jtag_tdi',
+        'jtag_trst',
+        'jtag_tdo',
+      ]) {
+        soc.exposePin(dbg, pin, externalName: pin);
+      }
+    }
 
     // To the core.
     core.input('debug_halt_req').srcConnection! <= dbg.output('halt_req');
@@ -2184,6 +2675,68 @@ class RiverGenIpConfig {
           busAddressWidth: busConfig.addressWidth,
           busDataWidth: busConfig.dataWidth,
           sources: mmioDevices.length + 1,
+        );
+      case 'spi':
+        // Generic SPI master. Pads (spi_clk/spi_mosi/spi_miso/spi_cs_n) are
+        // exposed and bound to a board connector via `iface=` (see [_ifacePins]).
+        return HarborSpiController(
+          baseAddress: dev.address,
+          busAddressWidth: busConfig.addressWidth,
+          busDataWidth: busConfig.dataWidth,
+          sdCard: dev.params?.sdcard ?? false,
+          // Optional integrated DMA master (fast SD block reads). Its master
+          // interface is wired to the fabric via addMaster below; the address
+          // width matches the fabric so it can reach all of memory.
+          dma: dev.params?.dma ?? false,
+          dmaAddressWidth: busConfig.addressWidth,
+          name: dev.name,
+        );
+      case 'sdio':
+        // Native SD/SDIO host. `ownPads` gives one bidirectional pad per CMD/DAT
+        // line (IOBUF), and `fabricDma` (from the `dma` param) exposes the ADMA
+        // engine as a Wishbone master wired to the fabric via addMaster below.
+        // 4-bit native SD: 4x the throughput of the 1-bit SPI path (the reason
+        // to use SDIO). DAT0..3 + CMD + CLK + CD map to the full PmodSD pinout.
+        return HarborSdioController(
+          baseAddress: dev.address,
+          config: HarborSdioConfig(
+            maxBusWidth: HarborSdioBusWidth.four,
+            // Reset default for the read-data sample edge. A real board with a
+            // marginal read-capture window (a long card round-trip at speed)
+            // sets samplefall=1 so the read DAT is sampled on the falling edge.
+            sampleReadOnFall: dev.params?.sampleFall ?? false,
+          ),
+          // FPGA/ASIC collapse CMD/DAT to bidirectional IOBUF pads; under
+          // Verilator keep the split out/oe/in ports so the C++ SD-card sim
+          // model can drive the response/data lines cleanly (inout pads are
+          // fiddly to drive from a host model), matching the ROHD SD oracle.
+          ownPads: target is! HarborSimTarget,
+          fabricDma: dev.params?.dma ?? false,
+          dmaAddressWidth: busConfig.addressWidth,
+          dmaDataWidth: busConfig.dataWidth,
+          busAddressWidth: busConfig.addressWidth,
+          busDataWidth: busConfig.dataWidth,
+          // On a posted-write DDR fabric an ADMA card-read's block writes are
+          // ACKed before they commit to DRAM, so raising data-done when the RX
+          // FIFO drains lets the CPU read the buffer while the last writes are
+          // still in flight (stale data -> the Arty S7 sustained-read reset).
+          // Fence the writes with a read-back so data-done means durable. Only
+          // when this SoC has both the ADMA and a real DDR memory; SRAM-only
+          // SoCs keep the byte-identical straight-through completion.
+          readBackBarrier:
+              (dev.params?.dma ?? false) &&
+              memories.any((m) => m.ddrBoard != null),
+          // Drop CYC after EVERY DDR write beat (not every 16) on a DDR SoC. The
+          // ADMA otherwise holds CYC across a burst; the DRAM CDC bridge wedges
+          // on back-to-back held-CYC transactions on silicon (it needs CYC to
+          // drop between transactions, the same hazard l1_cache guards the CPU
+          // against). One beat per bus grant gives the CDC that guarantee.
+          dmaBurstBeats:
+              (dev.params?.dma ?? false) &&
+                  memories.any((m) => m.ddrBoard != null)
+              ? 1
+              : 16,
+          name: dev.name,
         );
       default:
         return null;
@@ -2654,6 +3207,23 @@ class RiverGenIpConfig {
           (m) => m.type != 'flash',
           orElse: () => flash,
         );
+        // Boot banner, e.g. "River maskrom (RC1.f, Delta V1), jumping to FSBL
+        // in flash". The core id "rc1-f" reads as "RC1.f" (uppercase the RC1
+        // stem, keep the variant suffix) and the SoC name "delta_v1" reads as
+        // "Delta V1" (title-case each underscore-word).
+        final coreParts = cores.first.split('-');
+        final coreName = [
+          coreParts.first.toUpperCase(),
+          ...coreParts.skip(1),
+        ].join('.');
+        final socDisplay = name
+            .split('_')
+            .map(
+              (w) => w.isEmpty ? w : '${w[0].toUpperCase()}${w.substring(1)}',
+            )
+            .join(' ');
+        final banner =
+            'River maskrom ($coreName, $socDisplay), jumping to FSBL in flash\r\n';
         program = RiverMaskrom(
           RiverMaskromConfig(
             isa: coreConfig.isa,
@@ -2663,6 +3233,9 @@ class RiverGenIpConfig {
             copySize: 256, // warmup read window
             stackTop: stackMem.address + stackMem.size,
             bootMode: RiverBootMode.xipLaunch,
+            bootMessage: banner,
+            uartBase: uart.address,
+            uartDivisor: (clockFrequency ~/ 115200).clamp(1, 0xffff),
           ),
         );
       default:

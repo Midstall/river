@@ -22,10 +22,21 @@ class RiverCore extends BridgeModule {
   RiverCore(
     this.config, {
     Map<String, Logic> srcIrqs = const {},
+    // Machine timer / software interrupt-pending lines from the CLINT. Drive
+    // mip.MTIP(7) and mip.MSIP(3) respectively; null ties the bit to 0. The SoC
+    // wires these from the CLINT's timer_irq/sw_irq outputs (see genip).
+    Logic? timerPending,
+    Logic? swPending,
+    Logic? timeIn,
     List<String> staticInstructions = const [],
     WishboneConfig? busConfig,
     HarborDeviceTarget? target,
     bool withDebug = false,
+    // Number of hardware execute-breakpoint triggers (RISC-V mcontrol, type 2)
+    // exposed to the Debug Module. 0 = no triggers (byte-identical to before).
+    // Each trigger is tselect/tdata1/tdata2 and fires a cause-2 debug entry when
+    // an enabled execute trigger's tdata2 matches the instruction PC.
+    int debugTriggers = 0,
     // Expose plain bustap_ack/bustap_datmiso outputs mirroring the Wishbone
     // master's incoming ACK/read data for a logic analyzer. ACK is an input
     // here, so it must be mirrored to a plain output to stay hierarchy-legal.
@@ -35,6 +46,11 @@ class RiverCore extends BridgeModule {
     // seeds the OoO physical regfile. Asserted only while frozen during seeding;
     // null leaves it tied off.
     Logic? prfSeedMode,
+    // Test-only backdoor: the privilege the core holds coming out of reset.
+    // Real RISC-V resets to machine; a unit test that exercises S/U behavior
+    // (e.g. paged data translation) can pre-position the core in that mode
+    // instead of running a boot-time mret. null keeps the machine-mode reset.
+    int? resetPrivilege,
     super.name = 'river_core',
   }) : super('RiverCore') {
     final wbConfig =
@@ -79,6 +95,9 @@ class RiverCore extends BridgeModule {
     // High when a committing ebreak should enter Debug Mode (dcsr.ebreak* set for
     // the current privilege) instead of taking a breakpoint trap.
     Logic? ebreakDebug;
+    // Single-step in flight: set on resume when dcsr.step is high, cleared when
+    // the one stepped instruction commits (which re-enters Debug Mode, cause 4).
+    Logic? stepping;
     Logic? haltReqIn;
     Logic? resumeReqIn;
     // Abstract-command register access (driven by the Debug Module while halted).
@@ -93,6 +112,22 @@ class RiverCore extends BridgeModule {
     Logic? dbgRegAddr12; // low 12 bits of the regno = the CSR address
     Logic? dbgCsrSel; // halted && the regno is a CSR (borrow the CSR read port)
     Logic? dbgCsrData; // CSR file read result for a debug CSR access
+    // Hardware execute triggers (mcontrol, type 2). Present only when
+    // debugTriggers > 0. tdata1[i]/tdata2[i] are the per-trigger config/match;
+    // triggerMatch fires when an enabled execute trigger matches the current PC.
+    final hasTriggers = withDebug && debugTriggers > 0;
+    final tselectW = hasTriggers
+        ? (debugTriggers <= 1 ? 1 : (debugTriggers - 1).bitLength)
+        : 1;
+    Logic? tselect;
+    final List<Logic> tdata1 = [];
+    final List<Logic> tdata2 = [];
+    Logic? triggerMatch; // execute trigger matched the committing PC this cycle
+    Logic? dbgTselWrite; // debugger writing tselect
+    Logic? dbgTdata1Write; // debugger writing tdata1 (selected trigger)
+    Logic? dbgTdata2Write; // debugger writing tdata2 (selected trigger)
+    Logic? dbgTrigRdata; // read value for tselect/tdata1/tdata2/tinfo
+    Logic? dbgIsTrigCsr; // regno is one of the trigger CSRs (0x7a0..0x7a4)
     if (withDebug) {
       createPort('debug_halt_req', PortDirection.input);
       createPort('debug_resume_req', PortDirection.input);
@@ -114,6 +149,7 @@ class RiverCore extends BridgeModule {
       debugDpc = Logic(name: 'debugDpc', width: config.mxlen.size);
       debugDcsr = Logic(name: 'debugDcsr', width: 32);
       ebreakDebug = Logic(name: 'ebreakDebug');
+      stepping = Logic(name: 'stepping');
       output('debug_halted') <= debugHalted;
       output('debug_dpc') <= debugDpc;
 
@@ -140,8 +176,76 @@ class RiverCore extends BridgeModule {
         dbgCsrSel = ~isGpr & debugHalted;
         dbgCsrData = Logic(name: 'dbgCsrData', width: config.mxlen.size);
       }
-      // The register file is zero-latency, so the access is always ready.
-      output('debug_reg_ready') <= Const(1);
+      // debug_reg_ready is driven below, once `regs` exists: it must honor the
+      // regfile read latency (a registered BRAM read is 1+ cycles behind the
+      // address), otherwise the Debug Module latches stale read data.
+
+      // Hardware execute triggers (RISC-V trigger module, mcontrol type 2).
+      // OpenOCD programs tdata1/tdata2 over the abstract command while halted;
+      // an enabled execute trigger whose tdata2 matches the committing PC fires
+      // a cause-2 debug entry BEFORE the matched instruction runs (dpc = pc).
+      if (hasTriggers) {
+        tselect = Logic(name: 'tselect', width: tselectW);
+        for (var i = 0; i < debugTriggers; i++) {
+          tdata1.add(Logic(name: 'tdata1_$i', width: 32));
+          tdata2.add(Logic(name: 'tdata2_$i', width: config.mxlen.size));
+        }
+        final isTsel = dbgRegAddr12.eq(0x7a0);
+        final isTd1 = dbgRegAddr12.eq(0x7a1);
+        final isTd2 = dbgRegAddr12.eq(0x7a2);
+        final isTinfo = dbgRegAddr12.eq(0x7a4);
+        dbgIsTrigCsr = isTsel | isTd1 | isTd2 | isTinfo;
+        final wr = input('debug_reg_write') & debugHalted;
+        dbgTselWrite = wr & isTsel;
+        dbgTdata1Write = wr & isTd1;
+        dbgTdata2Write = wr & isTd2;
+        // Read multiplexers over the selected trigger. tselect out of range
+        // reads 0 so a debugger can count triggers (0..debugTriggers-1). Widen
+        // tselect before the compare: debugTriggers may not fit in tselectW bits
+        // (e.g. 4 needs 3 bits but tselectW is 2), which would truncate the bound
+        // and force the reads to 0 (breaks OpenOCD trigger discovery).
+        final selInRange = tselect.zeroExtend(32).lt(debugTriggers);
+        Logic selTdata1 = Const(0, width: 32);
+        Logic selTdata2 = Const(0, width: config.mxlen.size);
+        for (var i = 0; i < debugTriggers; i++) {
+          selTdata1 = mux(tselect.eq(i), tdata1[i], selTdata1);
+          selTdata2 = mux(tselect.eq(i), tdata2[i], selTdata2);
+        }
+        selTdata1 = mux(selInRange, selTdata1, Const(0, width: 32));
+        selTdata2 = mux(
+          selInRange,
+          selTdata2,
+          Const(0, width: config.mxlen.size),
+        );
+        // tinfo: bit N set for supported trigger type N. Only mcontrol (2).
+        dbgTrigRdata = mux(
+          isTsel,
+          tselect.zeroExtend(config.mxlen.size),
+          mux(
+            isTd1,
+            selTdata1.zeroExtend(config.mxlen.size),
+            mux(
+              isTd2,
+              selTdata2,
+              Const(1 << 2, width: config.mxlen.size), // tinfo
+            ),
+          ),
+        );
+        // Combinational execute-match against the committing PC.
+        Logic m = Const(0);
+        for (var i = 0; i < debugTriggers; i++) {
+          final t1 = tdata1[i];
+          final typeOk = t1.getRange(28, 32).eq(2);
+          final execute = t1[2];
+          final actionDebug = t1.getRange(12, 16).eq(1);
+          final modeEn =
+              (t1[6] & mode.eq(PrivilegeMode.machine.id)) |
+              (t1[4] & mode.eq(PrivilegeMode.supervisor.id)) |
+              (t1[3] & mode.eq(PrivilegeMode.user.id));
+          m = m | (typeOk & execute & actionDebug & modeEn & tdata2[i].eq(pc));
+        }
+        triggerMatch = m.named('triggerMatch');
+      }
     }
 
     final pagingMode = Logic(
@@ -287,6 +391,7 @@ class RiverCore extends BridgeModule {
 
     final icMemDone = Logic(name: 'icMemDone');
     final icMemValid = Logic(name: 'icMemValid');
+    final icMemFault = Logic(name: 'icMemFault');
     final icMemRdata = Logic(name: 'icMemRdata', width: config.mxlen.size);
     final icFlush = Logic(name: 'icFlush');
     // Driven from pipeline.fence below (forward ref); flushes the MMU fetch TLB.
@@ -312,6 +417,7 @@ class RiverCore extends BridgeModule {
       icache.input('flush').srcConnection! <= icFlush;
       icache.input('mem_done').srcConnection! <= icMemDone;
       icache.input('mem_valid').srcConnection! <= icMemValid;
+      icache.input('mem_fault').srcConnection! <= icMemFault;
       icache.input('mem_rdata').srcConnection! <= icMemRdata;
       if (dualDispatch) {
         icache.input('req_addr1').srcConnection! <= pipeFetchRead1!.addr;
@@ -381,9 +487,14 @@ class RiverCore extends BridgeModule {
       privMode: config.mmu.hasPaging ? mode : null,
       sum: config.mmu.hasPaging ? enableSum : null,
       mxr: config.mmu.hasPaging ? enableMxr : null,
-      // Translate instruction fetches (below M-mode). Gated off when an icache
-      // sits in front, since the icache does not yet propagate ifetch_fault.
-      translateFetch: config.mmu.hasPaging && !useICache,
+      // Translate instruction fetches (below M-mode). The icache is VIRTUALLY
+      // addressed, so its refill request carries a virtual address that the MMU
+      // MUST translate; gating this off left the refill reading the untranslated
+      // virtual address, which fetches garbage under any non-identity map (e.g.
+      // Linux's swapper mapping virtual 0xffffffff8000xxxx -> physical
+      // 0x8aaxxxxx). Fetch page-fault (ifetch_fault) reporting through the icache
+      // is still a gap, but a valid mapping (the common case) now translates.
+      translateFetch: config.mmu.hasPaging,
       tlbFlush: config.mmu.hasPaging ? mmuTlbFlush : null,
       dtlbFlushOnPrivChange: config.mmu.hasPaging ? dtlbFlushOnPriv : null,
     );
@@ -393,8 +504,11 @@ class RiverCore extends BridgeModule {
       // come from the cache. flush on fence.i (driven from the pipeline below).
       icMemDone <= mmu.ifetchDone;
       icMemValid <= mmu.ifetchValid;
+      icMemFault <= mmu.ifetchFault;
       icMemRdata <= mmu.ifetchRdata;
-      pipeFetchRead.done <= icache!.respValid;
+      // A faulting fetch is delivered as done AND not valid with respFault set, so
+      // the FetchUnit raises an instruction page fault (see ifetchFault below).
+      pipeFetchRead.done <= icache!.respValid | icache.respFault;
       pipeFetchRead.valid <= icache.respValid;
       pipeFetchRead.data <= icache.respData;
       if (dualDispatch) {
@@ -563,16 +677,18 @@ class RiverCore extends BridgeModule {
       final gprOrCsr = dbgCsrData == null
           ? regs.rd0Data
           : mux(dbgIsGpr!, regs.rd0Data, dbgCsrData);
+      final nonTrig = mux(
+        dbgIsDcsr!,
+        debugDcsr!.zeroExtend(config.mxlen.size),
+        mux(
+          dbgIsMisa!,
+          Const(config.isa.misaValue, width: config.mxlen.size),
+          mux(dbgIsDpc!, debugDpc!, gprOrCsr),
+        ),
+      );
+      // Trigger CSRs (tselect/tdata1/tdata2/tinfo) win when addressed.
       output('debug_reg_rdata') <=
-          mux(
-            dbgIsDcsr!,
-            debugDcsr!.zeroExtend(config.mxlen.size),
-            mux(
-              dbgIsMisa!,
-              Const(config.isa.misaValue, width: config.mxlen.size),
-              mux(dbgIsDpc!, debugDpc!, gprOrCsr),
-            ),
-          );
+          (hasTriggers ? mux(dbgIsTrigCsr!, dbgTrigRdata!, nonTrig) : nonTrig);
     }
     rs2Read.data <=
         mux(rs2Read.en, regs.rd1Data, Const(0, width: config.mxlen.size));
@@ -597,6 +713,18 @@ class RiverCore extends BridgeModule {
     rdWrite.done <= rdWrite.en;
     rdWrite.valid <= rdWrite.en;
 
+    // The Debug Module borrows read port 0 to service abstract register-access
+    // commands. Its ready must lag reg_read by the regfile read latency (the same
+    // delay the operand read applies), otherwise the DM latches stale read data on
+    // a registered-BRAM regfile (readLatency >= 1, e.g. the Xilinx/ECP5 builds).
+    if (withDebug) {
+      output('debug_reg_ready') <=
+          delayReadHandshake(
+            input('debug_reg_read') | input('debug_reg_write'),
+            'dbgRegReady',
+          );
+    }
+
     // Interrupts.
     Logic externalPending = Const(0);
     for (final entry in srcIrqs.entries) {
@@ -604,6 +732,18 @@ class RiverCore extends BridgeModule {
       final anyFromThis = sig.or();
       externalPending = externalPending | anyFromThis;
     }
+    // Per-cause CLINT lines: timer -> mip.MTIP, software -> mip.MSIP. Kept
+    // distinct from externalPending (MEIP) so the SBI timer and IPIs reach the
+    // right mcause, not the external-interrupt handler.
+    final timerPendingIn = timerPending == null
+        ? null
+        : addInput('timerPending', timerPending);
+    final swPendingIn = swPending == null
+        ? null
+        : addInput('swPending', swPending);
+    final timeInIn = timeIn == null
+        ? null
+        : addInput('timeIn', timeIn, width: timeIn.width);
 
     // CSR file.
     final csrRead = DataPortInterface(config.mxlen.size, 12);
@@ -731,6 +871,9 @@ class RiverCore extends BridgeModule {
             mhartid: config.hartId,
             rpipelineCap: config.rpipelineCap,
             externalPending: externalPending,
+            timerPending: timerPendingIn,
+            swPending: swPendingIn,
+            timeIn: timeInIn,
             hasSupervisor: config.hasSupervisor,
             hasUser: config.hasUser,
             hasHypervisor: config.hasHypervisor,
@@ -1074,6 +1217,80 @@ class RiverCore extends BridgeModule {
         ? null
         : addInput('prfSeedMode', prfSeedMode);
 
+    // Async interrupt take. Computes the highest-priority pending+enabled
+    // interrupt; the exec vectors it at an instruction boundary. M-interrupts
+    // (MSI/MTI/MEI = bits 3/7/11) are pending/enabled in mip/mie; S-interrupts
+    // (SSI/STI/SEI = 1/5/9) in the separate sip/sie (Weir writes sip.STIP for the
+    // SBI timer). Global enable per RISC-V: an M-interrupt is taken in S/U
+    // always and in M only if mstatus.MIE; an S-interrupt is taken in U always
+    // and in S only if sstatus.SIE, never in M. Priority MEI>MSI>MTI>SEI>SSI>STI.
+    Logic? interruptTake;
+    Logic? interruptCause;
+    if (csrs != null) {
+      final xlen = config.mxlen.size;
+      final isM = mode.eq(Const(PrivilegeMode.machine.id, width: 3));
+      final isS = mode.eq(Const(PrivilegeMode.supervisor.id, width: 3));
+      final isU = mode.eq(Const(PrivilegeMode.user.id, width: 3));
+      final mMie = csrs.mstatus[3]; // mstatus.MIE
+      final sSie = (csrs.sstatus ?? csrs.mstatus)[1]; // sstatus.SIE
+      final mGlobal = ((isM & mMie) | ~isM).named('mIntGlobal');
+      final sGlobal = ((isS & sSie) | isU).named('sIntGlobal');
+      final mPend = (csrs.mip & csrs.mie).named('mIntPend');
+      final sPend = config.hasSupervisor
+          ? (csrs.sip! & csrs.sie!).named('sIntPend')
+          : Const(0, width: xlen);
+      // (bit, isSupervisor), listed lowest priority first so the folds below let
+      // the highest priority win.
+      const order = [
+        (5, true), (1, true), (9, true), // STI, SSI, SEI
+        (7, false), (3, false), (11, false), // MTI, MSI, MEI
+      ];
+      Logic take = Const(0);
+      Logic cause = Const(0, width: 6);
+      for (final entry in order) {
+        final bit = entry.$1;
+        final isSup = entry.$2;
+        final t =
+            ((isSup ? sPend[bit] : mPend[bit]) & (isSup ? sGlobal : mGlobal))
+                .named('intTake_$bit');
+        cause = mux(t, Const(bit, width: 6), cause);
+        take = take | t;
+      }
+      // Register the interrupt-take decision. The mip/mie/mstatus/mode fold above
+      // otherwise sits combinationally in series with the exec -> nextPc -> fetch
+      // redirect (exec.dart:973 muxes the WHOLE exec output on interruptTake),
+      // and its wide fanout congests the fabric. On the timing-marginal openXC7
+      // delta build that combinational path costs ~7 MHz of core Fmax (measured:
+      // 41 MHz interrupt-off vs 34 MHz interrupt-on), and openXC7 STA is
+      // optimistic about the core clock, so that margin is load-bearing on
+      // silicon (an async interrupt taken here intermittently wedged the fetch).
+      // Delaying the take by one cycle is safe: the interrupt is async and
+      // level-sensitive, and the readyExecution gate plus the post-redirect fetch
+      // bubble let mstatus.MIE clear before the next instruction boundary, so a
+      // just-taken interrupt cannot double-fire.
+      final interruptTakeReg = Logic(name: 'interruptTakeReg');
+      final interruptCauseReg = Logic(name: 'interruptCauseReg', width: 6);
+      Sequential(clk, [
+        If(
+          reset,
+          then: [interruptTakeReg < 0, interruptCauseReg < 0],
+          orElse: [interruptTakeReg < take, interruptCauseReg < cause],
+        ),
+      ]);
+      // Re-apply the global interrupt-enable COMBINATIONALLY. interruptTakeReg
+      // reflects the enable state from one cycle ago; if software just cleared
+      // SIE/MIE (csrrci sstatus/mstatus to enter a critical section) the stale
+      // registered take must not fire a SPURIOUS interrupt into the now-disabled
+      // section. The heavy mip&mie + priority fold stays registered (the timing
+      // win); the global enable is a couple of mstatus bits, cheap and off the
+      // critical path. The registered cause identifies the privilege: S-causes
+      // are 1/5/9 (cause[1]=0), M-causes are 3/7/11 (cause[1]=1).
+      final takeSup = (~interruptCauseReg[1]).named('intTakeSup');
+      final curGlobal = mux(takeSup, sGlobal, mGlobal).named('curIntGlobal');
+      interruptTake = (interruptTakeReg & curGlobal).named('interruptTake');
+      interruptCause = interruptCauseReg.named('interruptCause');
+    }
+
     // Pipeline.
     pipeline = RiverPipeline(
       clk,
@@ -1111,6 +1328,8 @@ class RiverCore extends BridgeModule {
       medeleg: csrs?.medeleg,
       mtvec: csrs?.mtvec,
       stvec: csrs?.stvec,
+      interruptTake: interruptTake,
+      interruptCause: interruptCause,
       mepc: csrs?.mepc,
       sepc: (csrs != null && config.hasSupervisor) ? csrs.sepc : null,
       virt: virt,
@@ -1121,8 +1340,8 @@ class RiverCore extends BridgeModule {
       prfSeedEn: prfSeedModeIn == null ? null : (prfSeedModeIn & rdWrite.en),
       prfSeedAddr: prfSeedModeIn == null ? null : rdWrite.addr,
       prfSeedData: prfSeedModeIn == null ? null : rdWrite.data,
-      ifetchFault: (config.mmu.hasPaging && !useICache)
-          ? mmu.ifetchFault
+      ifetchFault: config.mmu.hasPaging
+          ? (useICache ? icache!.respFault : mmu.ifetchFault)
           : null,
       rdWrite1: rdWrite1,
       wr0Ready: wr0Ready,
@@ -1183,7 +1402,12 @@ class RiverCore extends BridgeModule {
       csrTrapTargetIsM <=
           pipeline.nextMode.eq(Const(PrivilegeMode.machine.id, width: 3));
       csrTrapPc <= pipeline.trapEpc;
-      csrTrapCauseVal <= pipeline.trapCause.zeroExtend(xlen);
+      // mcause = (interrupt << XLEN-1) | cause. trapCause carries only the low
+      // cause code (also used for delegation); the interrupt bit rides the
+      // separate trapInterrupt signal.
+      csrTrapCauseVal <=
+          (pipeline.trapInterrupt.zeroExtend(xlen) << (xlen - 1)) |
+              pipeline.trapCause.zeroExtend(xlen);
       csrTrapTval <= pipeline.trapTval;
       csrReturnActive <= committing & pipeline.isReturn;
       csrReturnFromM <= pipeline.returnLevel.eq(Const(3, width: 3));
@@ -1251,6 +1475,16 @@ class RiverCore extends BridgeModule {
         ? Const(0, width: xlen)
         : (csrs!.vstvec! & ~Const(0x3, width: xlen));
 
+    // The PC the committing instruction advances to (xRET restores from *epc,
+    // everything else takes the pipeline's next PC). Used as dpc for single-step.
+    final committedNextPc = mux(
+      pipeline.isReturn,
+      retPc,
+      (csrTrapToVS == null
+          ? pipeline.nextPc
+          : mux(csrTrapToVS, vsTrapPc, pipeline.nextPc)),
+    );
+
     // Core state machine. The normal (non-halted) advance body, captured so
     // debug-halt can gate it.
     final coreBody = <Conditional>[
@@ -1297,6 +1531,21 @@ class RiverCore extends BridgeModule {
               // Speculative fetch keeps the pipeline enabled and self-sequences,
               // so the commit fires every `done` cycle (distinct instructions).
               if (!config.speculativeFetch) pipelineEnable < 0,
+              // Single-step: this commit is the one stepped instruction; re-enter
+              // Debug Mode at the next PC (cause 4) and freeze the pipeline.
+              if (withDebug)
+                If(
+                  stepping!,
+                  then: [
+                    debugHalted! < 1,
+                    pipelineEnable < 0,
+                    debugDpc! < committedNextPc,
+                    debugDcsr! <
+                        (debugDcsr! & Const(0xFFFFFE3F, width: 32)) |
+                            Const(4 << 6, width: 32),
+                    stepping! < Const(0),
+                  ],
+                ),
             ],
           ),
           // Re-enable the pipeline once `done` drops (the next fetch is
@@ -1314,12 +1563,21 @@ class RiverCore extends BridgeModule {
           pipelineEnable < 0,
           pc < config.resetVector,
           sp < 0,
-          // RISC-V resets to machine mode (PrivilegeMode.machine == 3).
-          mode < PrivilegeMode.machine.id,
+          // RISC-V resets to machine mode (PrivilegeMode.machine == 3). Tests
+          // may override this to pre-position the core in S/U (resetPrivilege).
+          mode < (resetPrivilege ?? PrivilegeMode.machine.id),
           if (virt != null) virt < 0,
           fence < 0,
           interruptHold < 0,
           if (withDebug) debugHalted! < 0,
+          if (withDebug) stepping! < Const(0),
+          // Trigger reset: type=2 (mcontrol), no control bits, no match addr.
+          if (hasTriggers) tselect! < Const(0, width: tselectW),
+          if (hasTriggers)
+            for (var i = 0; i < debugTriggers; i++) ...[
+              tdata1[i] < Const(2 << 28, width: 32),
+              tdata2[i] < Const(0, width: config.mxlen.size),
+            ],
           if (withDebug) debugDpc! < config.resetVector,
           // dcsr reset: debugver=4 (0.13.2), prv=3 (machine), cause=0.
           if (withDebug) debugDcsr! < Const(0x40000003, width: 32),
@@ -1336,7 +1594,7 @@ class RiverCore extends BridgeModule {
                     // A debugger may rewrite dpc to redirect where we resume.
                     If(
                       input('debug_reg_write') & dbgIsDpc!,
-                      then: [debugDpc! < dbgRegWdata!],
+                      then: [debugDpc! < dbgRegWdata],
                     ),
                     // A debugger may write dcsr (ebreak/step/prv bits). debugver
                     // (31:28) is read-only and cause (8:6) is hardware-set, so
@@ -1345,13 +1603,55 @@ class RiverCore extends BridgeModule {
                       input('debug_reg_write') & dbgIsDcsr!,
                       then: [
                         debugDcsr! <
-                            (dbgRegWdata.getRange(0, 32) &
+                            (dbgRegWdata!.getRange(0, 32) &
                                     Const(0x0FFFFE3F, width: 32)) |
                                 Const(0x40000000, width: 32) |
                                 (debugDcsr & Const(0x000001C0, width: 32)),
                       ],
                     ),
-                    If(resumeReqIn!, then: [debugHalted < 0, pc < debugDpc]),
+                    // A debugger programs the hardware triggers (tselect picks
+                    // one; tdata1 is the mcontrol config, type forced to 2;
+                    // tdata2 is the match address).
+                    if (hasTriggers) ...[
+                      If(
+                        dbgTselWrite!,
+                        then: [tselect! < dbgRegWdata!.getRange(0, tselectW)],
+                      ),
+                      If(
+                        dbgTdata1Write!,
+                        then: [
+                          for (var i = 0; i < debugTriggers; i++)
+                            If(
+                              tselect!.eq(i),
+                              then: [
+                                tdata1[i] <
+                                    (dbgRegWdata!.getRange(0, 32) &
+                                            Const(0x0FFFFFFF, width: 32)) |
+                                        Const(2 << 28, width: 32),
+                              ],
+                            ),
+                        ],
+                      ),
+                      If(
+                        dbgTdata2Write!,
+                        then: [
+                          for (var i = 0; i < debugTriggers; i++)
+                            If(
+                              tselect!.eq(i),
+                              then: [tdata2[i] < dbgRegWdata!],
+                            ),
+                        ],
+                      ),
+                    ],
+                    If(
+                      resumeReqIn!,
+                      then: [
+                        debugHalted < 0,
+                        pc < debugDpc,
+                        // Arm single-step for this resume if dcsr.step is set.
+                        stepping! < debugDcsr![2],
+                      ],
+                    ),
                   ],
                   orElse: [
                     If(
@@ -1366,20 +1666,55 @@ class RiverCore extends BridgeModule {
                                 Const(3 << 6, width: 32),
                       ],
                       orElse: [
-                        If(
-                          ebreakDebug!,
-                          then: [
-                            // ebreak entered Debug Mode: freeze at the ebreak,
-                            // latch its pc into dpc, cause = 1 (ebreak).
-                            debugHalted < 1,
-                            pipelineEnable < 0,
-                            debugDpc < pipeline.trapEpc,
-                            debugDcsr <
-                                (debugDcsr & Const(0xFFFFFE3F, width: 32)) |
-                                    Const(1 << 6, width: 32),
-                          ],
-                          orElse: coreBody,
-                        ),
+                        // A hardware execute trigger fires BEFORE its matched
+                        // instruction runs: freeze at pc, cause = 2 (trigger).
+                        // The ternary keeps debugTriggers==0 byte-identical.
+                        hasTriggers
+                            ? If(
+                                triggerMatch!,
+                                then: [
+                                  debugHalted < 1,
+                                  pipelineEnable < 0,
+                                  debugDpc < pc,
+                                  debugDcsr <
+                                      (debugDcsr &
+                                              Const(0xFFFFFE3F, width: 32)) |
+                                          Const(2 << 6, width: 32),
+                                ],
+                                orElse: [
+                                  If(
+                                    ebreakDebug!,
+                                    then: [
+                                      debugHalted < 1,
+                                      pipelineEnable < 0,
+                                      debugDpc < pipeline.trapEpc,
+                                      debugDcsr <
+                                          (debugDcsr &
+                                                  Const(
+                                                    0xFFFFFE3F,
+                                                    width: 32,
+                                                  )) |
+                                              Const(1 << 6, width: 32),
+                                    ],
+                                    orElse: coreBody,
+                                  ),
+                                ],
+                              )
+                            : If(
+                                ebreakDebug!,
+                                then: [
+                                  // ebreak entered Debug Mode: freeze at the
+                                  // ebreak, latch pc into dpc, cause = 1.
+                                  debugHalted < 1,
+                                  pipelineEnable < 0,
+                                  debugDpc < pipeline.trapEpc,
+                                  debugDcsr <
+                                      (debugDcsr &
+                                              Const(0xFFFFFE3F, width: 32)) |
+                                          Const(1 << 6, width: 32),
+                                ],
+                                orElse: coreBody,
+                              ),
                       ],
                     ),
                   ],

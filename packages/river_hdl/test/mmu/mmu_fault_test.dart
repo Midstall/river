@@ -44,6 +44,8 @@ void main() {
 01 44 00 00 00 00 00 00
 @11000
 01 48 00 00 00 00 00 00
+@12000
+0F 00 00 00 00 00 00 00
 @12100
 0B C0 00 00 00 00 00 00
 ''';
@@ -57,7 +59,13 @@ void main() {
         selWidth: config.mxlen.size ~/ 8,
       );
 
-      final core = RiverCore(config, busConfig: wbConfig);
+      // Translation applies only in S/U mode (no MPRV in River), so the store
+      // page-fault must be observed from S-mode, not the M-mode reset default.
+      final core = RiverCore(
+        config,
+        busConfig: wbConfig,
+        resetPrivilege: PrivilegeMode.supervisor.id,
+      );
       core.input('clk').srcConnection! <= clk;
       core.input('reset').srcConnection! <= reset;
       await core.build();

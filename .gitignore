@@ -25,3 +25,8 @@ doc/api
 # working directory inside a package (not part of the source tree)
 *.db
 objects
+
+*.dtb
+*.dts
+*.asl
+*.aml

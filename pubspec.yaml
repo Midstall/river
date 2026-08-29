@@ -15,9 +15,8 @@ workspace:
 dependency_overrides:
   harbor:
     git:
-      url: https://github.com/MidstallSoftware/harbor.git
+      url: https://git.lilithsemi.com/LilithSemi/harbor
       path: packages/harbor
-      ref: fix/arty-s7-ddr
 
 dev_dependencies:
   coverage: ^1.15.0
